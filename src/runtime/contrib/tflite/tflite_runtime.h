@@ -29,44 +29,38 @@
 #include <tvm/runtime/ndarray.h>
 #include <tvm/runtime/packed_func.h>
 
-#include <vector>
-#include <string>
 #include <memory>
+#include <string>
+#include <vector>
 
 namespace tvm {
 namespace runtime {
 
+#define CHECK_TFLITE_STATUS(ret) CHECK_EQ(ret, kTfLiteOk)
 
 /*!
  * \brief Tflite runtime.
  *
- *  This runtime can be acccesibly in various language via
+ *  This runtime can be accessed in various language via
  *  TVM runtime PackedFunc API.
  */
 class TFLiteRuntime : public ModuleNode {
  public:
   /*!
-   * \brief Get member function to front-end
+   * \brief Get member function to front-end.
    * \param name The name of the function.
    * \param sptr_to_self The pointer to the module node.
    * \return The corresponding member function.
    */
-  virtual PackedFunc GetFunction(const std::string& name,
-                                 const ObjectPtr<Object>& sptr_to_self);
+  virtual PackedFunc GetFunction(const std::string& name, const ObjectPtr<Object>& sptr_to_self);
 
   /*!
    * \return The type key of the executor.
    */
-  const char* type_key() const final {
-    return "TFLiteRuntime";
-  }
+  const char* type_key() const { return "TFLiteRuntime"; }
 
   /*!
-   * \brief Update allocations for all tenssors. This is relatively expensive.
-   */
-  void AllocateTensors();
-  /*!
-   * \brief Invoke the internal tflite interpreter and run the whole model in 
+   * \brief Invoke the internal tflite interpreter and run the whole model in
    * dependency order.
    */
   void Invoke();
@@ -76,8 +70,7 @@ class TFLiteRuntime : public ModuleNode {
    * \param tflite_model_bytes The tflite model.
    * \param ctx The context where the tflite model will be executed on.
    */
-  void Init(const std::string& tflite_model_bytes,
-            TVMContext ctx);
+  void Init(const std::string& tflite_model_bytes, TVMContext ctx);
 
   /*!
    * \brief set index-th input to the model.
@@ -100,8 +93,9 @@ class TFLiteRuntime : public ModuleNode {
    */
   NDArray GetOutput(int index) const;
 
- private:
+  // TFLite interpreter
   std::unique_ptr<tflite::Interpreter> interpreter_;
+  // TVM context
   TVMContext ctx_;
 };
 

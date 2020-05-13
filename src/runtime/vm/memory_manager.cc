@@ -21,9 +21,11 @@
  * \file tvm/runtime/vm/memory_manager.cc
  * \brief Allocate and manage memory for the runtime.
  */
-#include <utility>
-#include <memory>
 #include "memory_manager.h"
+
+#include <memory>
+#include <utility>
+
 #include "naive_allocator.h"
 #include "pooled_allocator.h"
 
@@ -31,16 +33,17 @@ namespace tvm {
 namespace runtime {
 namespace vm {
 
-static void BufferDeleter(NDArray::Container* ptr) {
+static void BufferDeleter(Object* obj) {
+  auto* ptr = static_cast<NDArray::Container*>(obj);
   CHECK(ptr->manager_ctx != nullptr);
   Buffer* buffer = reinterpret_cast<Buffer*>(ptr->manager_ctx);
-  MemoryManager::Global()->GetAllocator(buffer->ctx)->
-      Free(*(buffer));
+  MemoryManager::Global()->GetAllocator(buffer->ctx)->Free(*(buffer));
   delete buffer;
   delete ptr;
 }
 
-void StorageObj::Deleter(NDArray::Container* ptr) {
+void StorageObj::Deleter(Object* obj) {
+  auto* ptr = static_cast<NDArray::Container*>(obj);
   // When invoking AllocNDArray we don't own the underlying allocation
   // and should not delete the buffer, but instead let it be reclaimed
   // by the storage object's destructor.
@@ -77,16 +80,23 @@ NDArray StorageObj::AllocNDArray(size_t offset, std::vector<int64_t> shape, DLDa
   // TODO(@jroesch): generalize later to non-overlapping allocations.
   CHECK_EQ(offset, 0u);
   VerifyDataType(dtype);
+
+  // crtical zone: allocate header, cannot throw
   NDArray::Container* container = new NDArray::Container(nullptr, shape, dtype, this->buffer.ctx);
-  container->deleter = StorageObj::Deleter;
+
+  container->SetDeleter(StorageObj::Deleter);
   size_t needed_size = GetDataSize(container->dl_tensor);
-  // TODO(@jroesch): generalize later to non-overlapping allocations.
-  CHECK(needed_size == this->buffer.size)
-    << "size mistmatch required " << needed_size << " found " << this->buffer.size;
   this->IncRef();
   container->manager_ctx = reinterpret_cast<void*>(this);
   container->dl_tensor.data = this->buffer.data;
-  return NDArray(container);
+  NDArray ret(GetObjectPtr<Object>(container));
+
+  // RAII in effect, now run the check.
+  // TODO(@jroesch): generalize later to non-overlapping allocations.
+  CHECK(needed_size == this->buffer.size)
+      << "size mistmatch required " << needed_size << " found " << this->buffer.size;
+
+  return ret;
 }
 
 MemoryManager* MemoryManager::Global() {
@@ -97,8 +107,8 @@ MemoryManager* MemoryManager::Global() {
 Allocator* MemoryManager::GetAllocator(TVMContext ctx) {
   std::lock_guard<std::mutex> lock(mu_);
   if (allocators_.find(ctx) == allocators_.end()) {
-    DLOG(INFO) << "New allocator for " << DeviceName(ctx.device_type) << "("
-               << ctx.device_id << ")";
+    DLOG(INFO) << "New allocator for " << DeviceName(ctx.device_type) << "(" << ctx.device_id
+               << ")";
     std::unique_ptr<Allocator> alloc(new NaiveAllocator(ctx));
     allocators_.emplace(ctx, std::move(alloc));
   }
@@ -108,14 +118,14 @@ Allocator* MemoryManager::GetAllocator(TVMContext ctx) {
 NDArray Allocator::Empty(std::vector<int64_t> shape, DLDataType dtype, DLContext ctx) {
   VerifyDataType(dtype);
   NDArray::Container* container = new NDArray::Container(nullptr, shape, dtype, ctx);
-  container->deleter = BufferDeleter;
+  container->SetDeleter(BufferDeleter);
   size_t size = GetDataSize(container->dl_tensor);
   size_t alignment = GetDataAlignment(container->dl_tensor);
-  Buffer *buffer = new Buffer;
+  Buffer* buffer = new Buffer;
   *buffer = this->Alloc(size, alignment, dtype);
   container->manager_ctx = reinterpret_cast<void*>(buffer);
   container->dl_tensor.data = buffer->data;
-  return NDArray(container);
+  return NDArray(GetObjectPtr<Object>(container));
 }
 
 }  // namespace vm
