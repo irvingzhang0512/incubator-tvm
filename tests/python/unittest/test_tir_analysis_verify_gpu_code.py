@@ -50,14 +50,14 @@ def test_shared_memory():
             if not tvm.context(target).exist:
                 continue
             valid = [None]
-            with tvm.target.build_config(**{"add_lower_pass": [
+            with tvm.transform.PassContext(config={"tir.add_lower_pass": [
                 (2, get_verify_pass(valid,
                                     max_shared_memory_per_block=type_size * M - 1,
                                     max_threads_per_block=M))]}):
                 tvm.build(s, [A, B], target)
             assert not valid[0]
 
-            with tvm.target.build_config(**{"add_lower_pass": [
+            with tvm.transform.PassContext(config={"tir.add_lower_pass": [
                 (2, get_verify_pass(valid,
                                     max_shared_memory_per_block=type_size * M,
                                     max_threads_per_block=M))]}):
@@ -87,14 +87,14 @@ def test_local_memory():
             continue
 
         valid = [None]
-        with tvm.target.build_config(**{"add_lower_pass": [
+        with tvm.transform.PassContext(config={"tir.add_lower_pass": [
             (2, get_verify_pass(valid,
                                 max_local_memory_per_block=4 * M - 1,
                                 max_threads_per_block=1))]}):
             tvm.build(s, [A, B], target)
         assert not valid[0]
 
-        with tvm.target.build_config(**{"add_lower_pass": [
+        with tvm.transform.PassContext(config={"tir.add_lower_pass": [
             (2, get_verify_pass(valid,
                                 max_local_memory_per_block=4 * M,
                                 max_threads_per_block=1))]}):
@@ -122,21 +122,21 @@ def test_num_thread():
             continue
 
         valid = [None]
-        with tvm.target.build_config(**{"add_lower_pass": [
+        with tvm.transform.PassContext(config={"tir.add_lower_pass": [
             (2, get_verify_pass(valid,
                                 max_shared_memory_per_block=0,
                                 max_threads_per_block=N - 1))]}):
             tvm.build(s, [A, B], target)
         assert not valid[0]
 
-        with tvm.target.build_config(**{"add_lower_pass": [
+        with tvm.transform.PassContext(config={"tir.add_lower_pass": [
             (2, get_verify_pass(valid,
                                 max_shared_memory_per_block=0,
                                 max_threads_per_block=N))]}):
             tvm.build(s, [A, B], target)
         assert valid[0]
 
-        with tvm.target.build_config(**{"add_lower_pass": [
+        with tvm.transform.PassContext(config={"tir.add_lower_pass": [
             (2, get_verify_pass(valid,
                                 max_shared_memory_per_block=0,
                                 max_threads_per_block=N,
@@ -144,7 +144,7 @@ def test_num_thread():
             tvm.build(s, [A, B], target)
         assert not valid[0]
 
-        with tvm.target.build_config(**{"add_lower_pass": [
+        with tvm.transform.PassContext(config={"tir.add_lower_pass": [
             (2, get_verify_pass(valid,
                                 max_shared_memory_per_block=0,
                                 max_threads_per_block=N,
@@ -172,14 +172,14 @@ def test_multiple_kernels():
             continue
 
         valid = [None]
-        with tvm.target.build_config(**{"add_lower_pass": [
+        with tvm.transform.PassContext(config={"tir.add_lower_pass": [
             (2, get_verify_pass(valid,
                                 max_shared_memory_per_block=0,
                                 max_threads_per_block=N - 1))]}):
             tvm.build(s, [A, C], target)
         assert not valid[0]
 
-        with tvm.target.build_config(**{"add_lower_pass": [
+        with tvm.transform.PassContext(config={"tir.add_lower_pass": [
             (2, get_verify_pass(valid,
                                 max_shared_memory_per_block=0,
                                 max_threads_per_block=N))]}):
@@ -203,10 +203,63 @@ def test_wrong_bind():
             continue
 
         valid = [None]
-        with tvm.target.build_config(**{"add_lower_pass": [
+        with tvm.transform.PassContext(config={"tir.add_lower_pass": [
                 (2, get_verify_pass(valid, max_threads_per_block=N*N))]}):
             tvm.build(s, [A, B], target)
         assert not valid[0]
+
+def test_vectorize():
+    N = 1024
+
+    A = te.placeholder((N, N), name='A')
+    B = te.compute((N, N), lambda i, j: A[i, j])
+
+    s = te.create_schedule([B.op])
+
+    i, j = s[B].op.axis
+
+    s[B].bind(i, te.thread_axis("blockIdx.x"))
+    jo, ji = s[B].split(j, factor=64)
+    s[B].bind(jo, te.thread_axis("threadIdx.x"))
+    s[B].vectorize(ji)
+
+    for target in ['opencl', 'cuda']:
+        if not tvm.context(target).exist:
+            continue
+
+        valid = [None]
+        with tvm.transform.PassContext(config={"tir.add_lower_pass": [
+                (2, get_verify_pass(valid, max_vector_bytes=16))]}):
+            tvm.lower(s, [A, B])
+        assert not valid[0]
+
+def test_vthread():
+    N = 1024
+
+    A = te.placeholder((N, 16), name='A')
+    B = te.compute((N, 16), lambda i, j: A[i, j])
+
+    s = te.create_schedule([B.op])
+
+    s[B].bind(s[B].op.axis[0], te.thread_axis("blockIdx.x"))
+    s[B].bind(s[B].op.axis[1], te.thread_axis("vthread"))
+
+    for target in ['opencl', 'cuda']:
+        if not tvm.context(target).exist:
+            continue
+
+        valid = [None]
+
+        for phase in [1, 2]:
+            with tvm.transform.PassContext(config={"tir.add_lower_pass": [
+                (phase, get_verify_pass(valid, max_vthread=16))]}):
+                tvm.build(s, [A, B], target)
+            assert valid[0]
+
+            with tvm.transform.PassContext(config={"tir.add_lower_pass": [
+                (phase, get_verify_pass(valid, max_vthread=15))]}):
+                tvm.build(s, [A, B], target)
+            assert not valid[0]
 
 
 if __name__ == "__main__":
@@ -215,3 +268,5 @@ if __name__ == "__main__":
     test_num_thread()
     test_multiple_kernels()
     test_wrong_bind()
+    test_vectorize()
+    test_vthread()

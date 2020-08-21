@@ -27,11 +27,11 @@
 #include <tvm/relay/qnn/transform.h>
 #include <tvm/relay/transform.h>
 #include <tvm/runtime/device_api.h>
-#include <tvm/runtime/vm.h>
 
 #include <memory>
 
 #include "../../target/source/codegen_source_base.h"
+#include "compile_engine.h"
 #include "utils.h"
 
 namespace tvm {
@@ -73,8 +73,8 @@ struct GraphCodegen {
     return CallFunc<Array<tvm::runtime::Module>>("get_external_modules", nullptr);
   }
 
-  Map<std::string, IRModule> GetIRModule() {
-    return CallFunc<Map<std::string, IRModule>>("get_irmodule", nullptr);
+  Map<String, IRModule> GetIRModule() {
+    return CallFunc<Map<String, IRModule>>("get_irmodule", nullptr);
   }
 
   std::unordered_map<std::string, tvm::runtime::NDArray> GetParams() {
@@ -135,7 +135,7 @@ class RelayBuildModule : public runtime::ModuleNode {
           [sptr_to_self, this](TVMArgs args, TVMRetValue* rv) { *rv = this->GetParams(); });
     } else if (name == "set_params") {
       return PackedFunc([sptr_to_self, this](TVMArgs args, TVMRetValue* rv) {
-        Map<std::string, Constant> params = args[0];
+        Map<String, Constant> params = args[0];
         for (const auto& kv : params) {
           this->SetParam(kv.first, kv.second->data);
         }
@@ -189,10 +189,10 @@ class RelayBuildModule : public runtime::ModuleNode {
   /*!
    * \brief Get params dictionary
    *
-   * \return Map<std::string, Constant> params dictionary
+   * \return Map<String, Constant> params dictionary
    */
-  Map<std::string, Constant> GetParams() {
-    Map<std::string, Constant> ret;
+  Map<String, Constant> GetParams() {
+    Map<String, Constant> ret;
     for (const auto& kv : ret_.params) {
       ret.Set(kv.first, Constant(kv.second));
     }
@@ -225,6 +225,8 @@ class RelayBuildModule : public runtime::ModuleNode {
     targets_ = targets;
     target_host_ = target_host;
     BuildRelay(mod, params_);
+    // Clear compile engine so that tuning schedules can be changed between runs. See issue #6096.
+    CompileEngine::Global()->Clear();
   }
 
  protected:
@@ -244,12 +246,14 @@ class RelayBuildModule : public runtime::ModuleNode {
       GlobalVar main_glb_var = relay_module->GetGlobalVar("main");
       Function main_func = Downcast<Function>(relay_module->Lookup(main_glb_var));
       auto new_main = BindParamsByName(main_func, params);
-      relay_module->Update(main_glb_var, new_main);
+      IRModuleNode* relay_module_ptr = relay_module.CopyOnWrite();
+      relay_module_ptr->Update(main_glb_var, new_main);
     }
 
     Array<Pass> pass_seqs;
     Array<runtime::String> entry_functions{"main"};
     pass_seqs.push_back(transform::RemoveUnusedFunctions(entry_functions));
+    pass_seqs.push_back(transform::ToBasicBlockNormalForm());
 
     // Run all dialect legalization passes.
     pass_seqs.push_back(relay::qnn::transform::Legalize());
@@ -275,8 +279,10 @@ class RelayBuildModule : public runtime::ModuleNode {
       }
     });
     pass_seqs.push_back(transform::EliminateCommonSubexpr(fskip));
+    pass_seqs.push_back(transform::SimplifyExpr());
     pass_seqs.push_back(transform::CombineParallelConv2D(3));
     pass_seqs.push_back(transform::CombineParallelDense(3));
+    pass_seqs.push_back(transform::CombineParallelBatchMatmul(3));
     pass_seqs.push_back(transform::FoldConstant());
     pass_seqs.push_back(transform::FoldScaleAxis());
     pass_seqs.push_back(transform::CanonicalizeCast());
@@ -304,7 +310,11 @@ class RelayBuildModule : public runtime::ModuleNode {
     // Handle heterogeneous compilation.
     transform::PassContext pass_ctx = PassContext::Current();
     if (targets_.size() > 1) {
-      relay_module = RunDeviceAnnotationPass(relay_module, pass_ctx->fallback_device);
+      Optional<Integer> opt_fallback_dev =
+          pass_ctx->GetConfig("relay.fallback_device_type", Integer(static_cast<int>(kDLCPU)));
+      auto fallback_dev = opt_fallback_dev.value();
+      CHECK_GT(fallback_dev->value, 0U);
+      relay_module = RunDeviceAnnotationPass(relay_module, fallback_dev->value);
     }
 
     // Fuse the operations if it is needed.
@@ -435,7 +445,7 @@ class RelayBuildModule : public runtime::ModuleNode {
       if (!target_host.defined())
         target_host = (pf != nullptr) ? target::llvm() : target::stackvm();
 
-      if (target_host.defined() && target_host->target_name == "llvm") {
+      if (target_host.defined() && target_host->kind->name == "llvm") {
         // If we can decide the target is LLVM, we then create an empty LLVM module.
         ret_.mod = (*pf)(target_host->str(), "empty_module");
       } else {
@@ -445,12 +455,15 @@ class RelayBuildModule : public runtime::ModuleNode {
         ret_.mod = tvm::codegen::CSourceModuleCreate(";", "");
       }
     } else {
-      ret_.mod = tvm::build(lowered_funcs, target_host_, BuildConfig::Current());
+      ret_.mod = tvm::build(lowered_funcs, target_host_);
     }
 
     Array<tvm::runtime::Module> ext_mods = graph_codegen_->GetExternalModules();
-    // Import all external runtime modules.
-    for (const auto& it : ext_mods) ret_.mod.Import(it);
+    // TODO(zhiics) We should be able to completely switch to MetadataModule no
+    // matter whether there are external modules or not.
+    if (!ext_mods.empty()) {
+      ret_.mod = tvm::codegen::CreateMetadataModule(ret_.params, ret_.mod, ext_mods);
+    }
   }
 
  private:
@@ -458,7 +471,7 @@ class RelayBuildModule : public runtime::ModuleNode {
     Target target_host = target_host_;
     if (!target_host_.defined()) {
       for (const auto& it : targets_) {
-        if (it.second->device_type == kDLCPU) {
+        if (it.second->kind->device_type == kDLCPU) {
           target_host = it.second;
           break;
         }
@@ -490,7 +503,7 @@ TVM_REGISTER_GLOBAL("relay.build_module._BuildModule").set_body([](TVMArgs args,
 
 TVM_REGISTER_GLOBAL("relay.build_module.BindParamsByName")
     .set_body([](TVMArgs args, TVMRetValue* rv) {
-      Map<std::string, Constant> params = args[1];
+      Map<String, Constant> params = args[1];
       std::unordered_map<std::string, runtime::NDArray> params_;
       for (const auto& kv : params) {
         params_[kv.first] = kv.second->data;

@@ -64,6 +64,10 @@ struct TypeIndex {
     kRuntimeNDArray = 2,
     /*! \brief runtime::String. */
     kRuntimeString = 3,
+    /*! \brief runtime::Array. */
+    kRuntimeArray = 4,
+    /*! \brief runtime::Map. */
+    kRuntimeMap = 5,
     // static assignments that may subject to change.
     kRuntimeClosure,
     kRuntimeADT,
@@ -83,10 +87,10 @@ struct TypeIndex {
  *      the type index will be assigned during runtime.
  *      Runtime type index can be accessed by ObjectType::TypeIndex();
  * - _type_key:
- *       The unique string identifier of tyep type.
+ *       The unique string identifier of the type.
  * - _type_final:
  *       Whether the type is terminal type(there is no subclass of the type in the object system).
- *       This field is automatically set by marco TVM_DECLARE_FINAL_OBJECT_INFO
+ *       This field is automatically set by macro TVM_DECLARE_FINAL_OBJECT_INFO
  *       It is still OK to sub-class a terminal object type T and construct it using make_object.
  *       But IsInstance check will only show that the object type is T(instead of the sub-class).
  *
@@ -136,7 +140,7 @@ struct TypeIndex {
  *    // object properties
  *    static constexpr const uint32_t _type_index = TypeIndex::kDynamic;
  *    static constexpr const char* _type_key = "test.LeafObj";
- *    TVM_DECLARE_BASE_OBJECT_INFO(LeaffObj, Object);
+ *    TVM_DECLARE_BASE_OBJECT_INFO(LeafObj, Object);
  *  };
  *
  *  // The following code should be put into a cc file.
@@ -475,7 +479,7 @@ class ObjectPtr {
   // friend classes
   friend class Object;
   friend class ObjectRef;
-  friend struct ObjectHash;
+  friend struct ObjectPtrHash;
   template <typename>
   friend class ObjectPtr;
   template <typename>
@@ -585,9 +589,10 @@ class ObjectRef {
     return ObjectPtr<ObjectType>(ref.data_.data_);
   }
   // friend classes.
-  friend struct ObjectHash;
+  friend struct ObjectPtrHash;
   friend class TVMRetValue;
   friend class TVMArgsSetter;
+  friend class ObjectInternal;
   template <typename SubRef, typename BaseRef>
   friend SubRef Downcast(BaseRef ref);
 };
@@ -604,7 +609,7 @@ template <typename BaseType, typename ObjectType>
 inline ObjectPtr<BaseType> GetObjectPtr(ObjectType* ptr);
 
 /*! \brief ObjectRef hash functor */
-struct ObjectHash {
+struct ObjectPtrHash {
   size_t operator()(const ObjectRef& a) const { return operator()(a.data_); }
 
   template <typename T>
@@ -614,7 +619,7 @@ struct ObjectHash {
 };
 
 /*! \brief ObjectRef equal functor */
-struct ObjectEqual {
+struct ObjectPtrEqual {
   bool operator()(const ObjectRef& a, const ObjectRef& b) const { return a.same_as(b); }
 
   template <typename T>
@@ -698,6 +703,7 @@ struct ObjectEqual {
   explicit TypeName(::tvm::runtime::ObjectPtr<::tvm::runtime::Object> n) : ParentType(n) {}    \
   TVM_DEFINE_DEFAULT_COPY_MOVE_AND_ASSIGN(TypeName);                                           \
   const ObjectName* operator->() const { return static_cast<const ObjectName*>(data_.get()); } \
+  const ObjectName* get() const { return operator->(); }                                       \
   using ContainerType = ObjectName;
 
 /*
@@ -711,6 +717,7 @@ struct ObjectEqual {
   explicit TypeName(::tvm::runtime::ObjectPtr<::tvm::runtime::Object> n) : ParentType(n) {}    \
   TVM_DEFINE_DEFAULT_COPY_MOVE_AND_ASSIGN(TypeName);                                           \
   const ObjectName* operator->() const { return static_cast<const ObjectName*>(data_.get()); } \
+  const ObjectName* get() const { return operator->(); }                                       \
   static constexpr bool _type_is_nullable = false;                                             \
   using ContainerType = ObjectName;
 

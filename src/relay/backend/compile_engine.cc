@@ -23,7 +23,6 @@
  */
 #include "compile_engine.h"
 
-#include <topi/tags.h>
 #include <tvm/driver/driver_api.h>
 #include <tvm/ir/type_functor.h>
 #include <tvm/relay/analysis.h>
@@ -37,6 +36,7 @@
 #include <tvm/te/operation.h>
 #include <tvm/te/schedule.h>
 #include <tvm/te/schedule_pass.h>
+#include <tvm/topi/tags.h>
 
 #include <functional>
 #include <limits>
@@ -191,7 +191,7 @@ class ScheduleGetter : public backend::MemoizedExprTranslator<Array<te::Tensor>>
   }
 
   Array<te::Tensor> VisitExpr_(const CallNode* call_node) final {
-    static auto fpattern = Op::GetAttr<TOpPattern>("TOpPattern");
+    static auto fpattern = Op::GetAttrMap<TOpPattern>("TOpPattern");
     static auto flower_call = tvm::runtime::Registry::Get("relay.backend.lower_call");
     CHECK(flower_call) << "relay.backend.lower_call is not registered.";
 
@@ -217,8 +217,7 @@ class ScheduleGetter : public backend::MemoizedExprTranslator<Array<te::Tensor>>
     // Skip fcompute for device copy operators as it is not registered.
     if (op == device_copy_op_) {
       const auto* copy_input = inputs[0].operator->();
-      outputs.push_back(
-          te::TensorNode::make(copy_input->shape, copy_input->dtype, te::Operation(), 0));
+      outputs.push_back(te::Tensor(copy_input->shape, copy_input->dtype, te::Operation(), 0));
     } else {
       LoweredOutput lowered_out = (*flower_call)(GetRef<Call>(call_node), inputs, target_);
       outputs = lowered_out->outputs;
@@ -454,8 +453,8 @@ class MakeShapeFunc : public backend::MemoizedExprTranslator<Array<te::Tensor>> 
   }
 
   Array<te::Tensor> VisitExpr_(const CallNode* call_node) final {
-    static auto fshape_func = Op::GetAttr<FShapeFunc>("FShapeFunc");
-    static auto tshape_data_dependant = Op::GetAttr<TShapeDataDependant>("TShapeDataDependant");
+    static auto fshape_func = Op::GetAttrMap<FShapeFunc>("FShapeFunc");
+    static auto tshape_data_dependant = Op::GetAttrMap<TShapeDataDependant>("TShapeDataDependant");
     CHECK(call_node->op.as<OpNode>()) << "Primitive function only allows call into primitive ops";
     Op op = Downcast<Op>(call_node->op);
     CHECK(data_dependants_.empty() || !data_dependants_.back())
@@ -525,15 +524,22 @@ class MakeShapeFunc : public backend::MemoizedExprTranslator<Array<te::Tensor>> 
     return fields;
   }
 
+  Array<te::Tensor> VisitExpr_(const TupleGetItemNode* op) final {
+    Array<te::Tensor> input_shapes = VisitExpr(op->tuple);
+    Array<te::Tensor> out;
+    out.push_back(input_shapes[op->index]);
+    return out;
+  }
+
  private:
   /*! \brief String stream for function name */
   std::ostringstream readable_name_stream_;
   /*! \brief Map from parameter to its shape function usage state */
-  std::unordered_map<Expr, int, ObjectHash, ObjectEqual> param_states_;
+  std::unordered_map<Expr, int, ObjectPtrHash, ObjectPtrEqual> param_states_;
   /*! \brief Map from parameter to list of data placeholder */
-  std::unordered_map<Expr, Array<te::Tensor>, ObjectHash, ObjectEqual> param_data_;
+  std::unordered_map<Expr, Array<te::Tensor>, ObjectPtrHash, ObjectPtrEqual> param_data_;
   /*! \brief Map from parameter to list of shape placeholder */
-  std::unordered_map<Expr, Array<te::Tensor>, ObjectHash, ObjectEqual> param_shapes_;
+  std::unordered_map<Expr, Array<te::Tensor>, ObjectPtrHash, ObjectPtrEqual> param_shapes_;
   /*! \brief Stack of data dependencies for shape function */
   std::vector<bool> data_dependants_;
   /*! \brief Scalars used in the shape function */
@@ -554,7 +560,7 @@ class CompileEngineImpl : public CompileEngineNode {
     if (const auto* f = runtime::Registry::Get("relay.backend.build")) {
       m = (*f)(value->cached_func->funcs, key->target);
     } else {
-      m = build(value->cached_func->funcs, key->target, Target(nullptr), BuildConfig::Current());
+      m = build(value->cached_func->funcs, key->target, Target(nullptr));
     }
     value->packed_func = m.GetFunction(value->cached_func->func_name);
     return value->packed_func;
@@ -565,7 +571,8 @@ class CompileEngineImpl : public CompileEngineNode {
   }
 
   Array<tvm::runtime::Module> LowerExternalFunctions() {
-    std::unordered_map<std::string, IRModule> ext_mods;
+    Array<tvm::runtime::Module> ret;
+    std::unordered_map<std::string, std::string> cached_symbol;
     std::vector<CCacheKey> cached_ext_funcs;
     for (const auto& it : cache_) {
       auto src_func = it.first->source_func;
@@ -574,26 +581,31 @@ class CompileEngineImpl : public CompileEngineNode {
         auto code_gen = src_func->GetAttr<String>(attr::kCompiler);
         CHECK(code_gen.defined()) << "No external codegen is set";
         std::string code_gen_name = code_gen.value();
-        if (ext_mods.find(code_gen_name) == ext_mods.end()) {
-          ext_mods[code_gen_name] = IRModule({}, {});
-        }
+        cached_ext_funcs.push_back(it.first);
+
         auto symbol_name = src_func->GetAttr<String>(tvm::attr::kGlobalSymbol);
         CHECK(symbol_name.defined()) << "No external symbol is set for:\n"
                                      << AsText(src_func, false);
-        auto gv = GlobalVar(std::string(symbol_name.value()));
-        ext_mods[code_gen_name]->Add(gv, src_func);
-        cached_ext_funcs.push_back(it.first);
-      }
-    }
 
-    Array<tvm::runtime::Module> ret;
-    for (const auto& it : ext_mods) {
-      std::string ext_name = "relay.ext." + it.first;
-      auto pf = tvm::runtime::Registry::Get(ext_name);
-      CHECK(pf) << "Failed to find the codegen tool for " << ext_name << "\n";
-      runtime::Module ext_mod = (*pf)(it.second);
-      CHECK(ext_mod.defined()) << "No external runtime is generated.";
-      ret.push_back(ext_mod);
+        std::string sn = symbol_name.value();
+        if (cached_symbol.count(sn)) {
+          cached_symbol[sn] = code_gen_name;
+        } else {
+          CHECK_NE(sn, code_gen_name)
+              << "Found duplicated symbol: " << sn << " for: " << code_gen_name;
+        }
+
+        std::string ext_name = "relay.ext." + code_gen_name;
+        auto pf = tvm::runtime::Registry::Get(ext_name);
+        CHECK(pf) << "Failed to find the codegen tool for " << ext_name << "\n";
+        // No need to keep compiler attribute at this point, functions have been
+        // extracted for specific codegen.
+        src_func = WithAttr(std::move(src_func), attr::kCompiler, NullValue<ObjectRef>());
+        runtime::Module ext_mod = (*pf)(src_func);
+
+        CHECK(ext_mod.defined()) << "No external runtime is generated.";
+        ret.push_back(ext_mod);
+      }
     }
 
     // No need to cache external functions as we collected them all to create
@@ -649,6 +661,7 @@ class CompileEngineImpl : public CompileEngineNode {
       CHECK(name_node.defined()) << "External function has not been attached a name yet.";
       cache_node->func_name = std::string(name_node.value());
       cache_node->target = tvm::target::ext_dev();
+      cache_node->funcs->Add(GlobalVar(cache_node->func_name), key->source_func);
       value->cached_func = CachedFunc(cache_node);
       return value;
     }
@@ -678,9 +691,11 @@ class CompileEngineImpl : public CompileEngineNode {
     if (const auto* f = runtime::Registry::Get("relay.backend.lower")) {
       cache_node->funcs = (*f)(cfunc->schedule, all_args, cache_node->func_name, key->source_func);
     } else {
-      tvm::BuildConfig bcfg = BuildConfig::Create();
+      using tvm::transform::PassContext;
+      With<PassContext> fresh_pass_ctx_scope(PassContext::Create());
+
       std::unordered_map<te::Tensor, tir::Buffer> binds;
-      cache_node->funcs = tvm::lower(cfunc->schedule, all_args, cache_node->func_name, binds, bcfg);
+      cache_node->funcs = tvm::lower(cfunc->schedule, all_args, cache_node->func_name, binds);
     }
     value->cached_func = CachedFunc(cache_node);
     return value;
@@ -712,9 +727,12 @@ class CompileEngineImpl : public CompileEngineNode {
     for (te::Tensor arg : cache_node->outputs) {
       all_args.push_back(arg);
     }
-    tvm::BuildConfig bcfg = BuildConfig::Create();
+
+    using tvm::transform::PassContext;
+    With<PassContext> fresh_pass_ctx_scope(PassContext::Create());
+
     std::unordered_map<te::Tensor, tir::Buffer> binds;
-    cache_node->funcs = tvm::lower(spair.first, all_args, cache_node->func_name, binds, bcfg);
+    cache_node->funcs = tvm::lower(spair.first, all_args, cache_node->func_name, binds);
     value->cached_func = CachedFunc(cache_node);
     return value;
   }
@@ -752,7 +770,7 @@ class CompileEngineImpl : public CompileEngineNode {
 };
 
 /*! \brief The global compile engine */
-const CompileEngine& CompileEngine::Global() {
+CompileEngine& CompileEngine::Global() {
   // intentionally allocate raw pointer to avoid
   // free during destructuion.
   static CompileEngine* inst = new CompileEngine(make_object<CompileEngineImpl>());

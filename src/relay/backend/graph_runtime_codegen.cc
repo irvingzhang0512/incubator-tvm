@@ -54,7 +54,7 @@ using TargetsMap = std::unordered_map<int, Target>;
 /*! \brief Lowered outputs */
 struct LoweredOutput {
   std::string graph_json;
-  Map<std::string, IRModule> lowered_funcs;
+  Map<String, IRModule> lowered_funcs;
   Array<tvm::runtime::Module> external_mods;
   std::unordered_map<std::string, tvm::runtime::NDArray> params;
 };
@@ -207,7 +207,7 @@ class GraphRuntimeCodegen : public backend::MemoizedExprTranslator<std::vector<G
 
     for (auto& kv : lowered_funcs_) {
       if (ret.lowered_funcs.count(kv.first) == 0) {
-        ret.lowered_funcs.Set(kv.first, IRModule::Empty());
+        ret.lowered_funcs.Set(kv.first, IRModule());
       }
       auto& mod = ret.lowered_funcs[kv.first];
       mod->Update(kv.second);
@@ -368,6 +368,14 @@ class GraphRuntimeCodegen : public backend::MemoizedExprTranslator<std::vector<G
       CCacheKey key = (*pf0)(func, target);
       CachedFunc ext_func = (*pf1)(compile_engine_, key);
       CHECK(ext_func.defined()) << "External function is not defined.";
+
+      // Step into the functions that are handled by external codegen to
+      // collect metadata.
+      const auto name_node = func->GetAttr<String>(tvm::attr::kGlobalSymbol);
+      std::string symobl = std::string(name_node.value());
+      ConstantUpdater const_visit(symobl, &params_);
+      const_visit(func);
+
       return GraphAddCallNode(op, ext_func->func_name, ext_func->func_name);
     }
 
@@ -395,7 +403,7 @@ class GraphRuntimeCodegen : public backend::MemoizedExprTranslator<std::vector<G
     CCacheKey key = (*pf0)(func, target);
     CachedFunc lowered_func = (*pf1)(compile_engine_, key);
     if (!lowered_funcs_.count(target->str())) {
-      lowered_funcs_[target->str()] = IRModule::Empty();
+      lowered_funcs_[target->str()] = IRModule();
     }
     lowered_funcs_[target->str()]->Update(lowered_func->funcs);
     return GraphAddCallNode(op, _GetUniqueName(lowered_func->func_name), lowered_func->func_name);
@@ -579,7 +587,7 @@ class GraphRuntimeCodegenModule : public runtime::ModuleNode {
       });
     } else if (name == "get_param_by_name") {
       return PackedFunc([sptr_to_self, this](TVMArgs args, TVMRetValue* rv) {
-        std::string key = args[0];
+        String key = args[0];
         CHECK_GT(this->output_.params.count(key), 0);
         *rv = this->output_.params[key];
       });
@@ -634,7 +642,6 @@ struct Handler<std::shared_ptr<tvm::relay::backend::GraphNode>> {
     LOG(FATAL) << "Not implemented.";
   }
 };
-
 template <>
 struct Handler<std::unordered_map<std::string, dmlc::any>> {
   inline static void Write(dmlc::JSONWriter* writer,
@@ -653,6 +660,8 @@ struct Handler<std::unordered_map<std::string, dmlc::any>> {
         writer->WriteObjectKeyValue(k, dmlc::get<std::vector<std::vector<int64_t>>>(v));
       } else if (SameType<std::vector<std::string>>(v)) {
         writer->WriteObjectKeyValue(k, dmlc::get<std::vector<std::string>>(v));
+      } else if (SameType<std::vector<dmlc::any>>(v)) {
+        writer->WriteObjectKeyValue(k, dmlc::get<std::vector<dmlc::any>>(v));
       } else {
         LOG(FATAL) << "Not supported";
       }

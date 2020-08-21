@@ -81,11 +81,10 @@ def get_synset():
 
 
 def run_tvm_model(mod, params, input_name, inp, target="llvm"):
-    with relay.build_config(opt_level=3):
-        json, lib, params = relay.build(mod, target=target, params=params)
+    with tvm.transform.PassContext(opt_level=3):
+        lib = relay.build(mod, target=target, params=params)
 
-    runtime = tvm.contrib.graph_runtime.create(json, lib, tvm.context(target, 0))
-    runtime.set_input(**params)
+    runtime = tvm.contrib.graph_runtime.GraphModule(lib['default'](tvm.context(target, 0)))
 
     runtime.set_input(input_name, inp)
     runtime.run()

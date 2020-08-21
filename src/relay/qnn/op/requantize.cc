@@ -153,9 +153,19 @@ Expr RequantizeLower(const Expr& input_tensor, const Expr& input_scale,
         static_cast<double>(input_scale_float) / static_cast<double>(output_scale_float);
     // Skip if input and output scales are same.
     if (!IsEqualScalar(input_scale, output_scale)) {
+      int32_t fixed_point_multiplier, shift;
+      std::tie(fixed_point_multiplier, shift) = GetFixedPointMultiplierShift(double_multiplier);
+
+      const bool is_upward_rounding = (param->rounding == "UPWARD");
+
+      // When using upward rounding (i.e., x.5 rounded to x+1), leverage
+      // the FixedPointMultiply operator
       scaled_int32_t =
-          FixedPointMultiply(scaled_int32_t, double_multiplier, input_shape, param->rounding);
+          (is_upward_rounding
+               ? FixedPointMultiply(scaled_int32_t, fixed_point_multiplier, shift)
+               : FixedPointMultiplyToNearest(scaled_int32_t, double_multiplier, input_shape));
     }
+
   } else {
     // This is per-channel (per=axis) quantization.
     std::vector<double> double_multipliers;
@@ -281,7 +291,7 @@ bool RequantizeRel(const Array<Type>& types, int num_inputs, const Attrs& attrs,
 // Positional relay function to create qnn requantize operator
 // used by frontend FFI.
 Expr MakeRequantize(Expr data, Expr input_scale, Expr input_zero_point, Expr output_scale,
-                    Expr output_zero_point, int axis, std::string rounding, DataType out_dtype) {
+                    Expr output_zero_point, int axis, String rounding, DataType out_dtype) {
   auto attrs = make_object<RequantizeAttrs>();
   attrs->axis = axis;
   attrs->rounding = std::move(rounding);

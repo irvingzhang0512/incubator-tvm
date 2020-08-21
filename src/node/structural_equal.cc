@@ -29,7 +29,7 @@
 
 namespace tvm {
 
-// Define the dispatch functio here since primary user is in this file.
+// Define the dispatch function here since primary user is in this file.
 bool ReflectionVTable::SEqualReduce(const Object* self, const Object* other,
                                     SEqualReducer equal) const {
   uint32_t tindex = self->type_index();
@@ -216,9 +216,9 @@ class RemapVarSEqualHandler : public SEqualReducer::Handler {
   // reflection vtable
   ReflectionVTable* vtable_ = ReflectionVTable::Global();
   // map from lhs to rhs
-  std::unordered_map<ObjectRef, ObjectRef, ObjectHash, ObjectEqual> equal_map_lhs_;
+  std::unordered_map<ObjectRef, ObjectRef, ObjectPtrHash, ObjectPtrEqual> equal_map_lhs_;
   // map from rhs to lhs
-  std::unordered_map<ObjectRef, ObjectRef, ObjectHash, ObjectEqual> equal_map_rhs_;
+  std::unordered_map<ObjectRef, ObjectRef, ObjectPtrHash, ObjectPtrEqual> equal_map_rhs_;
 };
 
 TVM_REGISTER_GLOBAL("node.StructuralEqual")

@@ -56,6 +56,8 @@ class VulkanThreadEntry {
     // the instance and device get destroyed.
     // The destruction need to be manually called
     // to ensure the destruction order.
+
+    pool.reset();
     streams_.clear();
     for (const auto& kv : staging_buffers_) {
       if (!kv.second) {
@@ -75,7 +77,7 @@ class VulkanThreadEntry {
   }
 
   TVMContext ctx;
-  WorkspacePool pool;
+  std::unique_ptr<WorkspacePool> pool;
   VulkanStream* Stream(size_t device_id);
   VulkanStagingBuffer* StagingBuffer(int device_id, size_t size);
 
@@ -331,15 +333,15 @@ class VulkanDeviceAPI final : public DeviceAPI {
   }
 
   void* AllocWorkspace(TVMContext ctx, size_t size, DLDataType type_hint) final {
-    return VulkanThreadEntry::ThreadLocal()->pool.AllocWorkspace(ctx, size);
+    return VulkanThreadEntry::ThreadLocal()->pool->AllocWorkspace(ctx, size);
   }
 
   void FreeWorkspace(TVMContext ctx, void* data) final {
-    VulkanThreadEntry::ThreadLocal()->pool.FreeWorkspace(ctx, data);
+    VulkanThreadEntry::ThreadLocal()->pool->FreeWorkspace(ctx, data);
   }
 
-  static const std::shared_ptr<VulkanDeviceAPI>& Global() {
-    static std::shared_ptr<VulkanDeviceAPI> inst = std::make_shared<VulkanDeviceAPI>();
+  static VulkanDeviceAPI* Global() {
+    static VulkanDeviceAPI* inst = new VulkanDeviceAPI();
     return inst;
   }
 
@@ -366,7 +368,7 @@ void VulkanDeviceAPI::GetAttr(TVMContext ctx, DeviceAttrKind kind, TVMRetValue* 
     case kMaxThreadsPerBlock: {
       VkPhysicalDeviceProperties phy_prop;
       vkGetPhysicalDeviceProperties(vctx.phy_device, &phy_prop);
-      int64_t value = phy_prop.limits.maxComputeWorkGroupSize[0];
+      int64_t value = phy_prop.limits.maxComputeWorkGroupInvocations;
       *rv = value;
       break;
     }
@@ -399,9 +401,23 @@ void VulkanDeviceAPI::GetAttr(TVMContext ctx, DeviceAttrKind kind, TVMRetValue* 
       return;
     case kExist:
       break;
-    case kMaxThreadDimensions:
+    case kMaxThreadDimensions: {
+      VkPhysicalDeviceProperties phy_prop;
+      vkGetPhysicalDeviceProperties(vctx.phy_device, &phy_prop);
+      int64_t dims[3];
+      dims[0] = phy_prop.limits.maxComputeWorkGroupSize[0];
+      dims[1] = phy_prop.limits.maxComputeWorkGroupSize[1];
+      dims[2] = phy_prop.limits.maxComputeWorkGroupSize[2];
+      std::stringstream ss;  // use json string to return multiple int values;
+      ss << "[" << dims[0] << ", " << dims[1] << ", " << dims[2] << "]";
+      *rv = ss.str();
       break;
+    }
+    case kMaxRegistersPerBlock:
+      return;
     case kGcnArch:
+      return;
+    case kApiVersion:
       return;
   }
 }
@@ -999,7 +1015,8 @@ VulkanStagingBuffer* VulkanThreadEntry::StagingBuffer(int device_id, size_t size
 }
 
 VulkanThreadEntry::VulkanThreadEntry()
-    : pool(static_cast<DLDeviceType>(kDLVulkan), VulkanDeviceAPI::Global()) {
+    : pool(std::make_unique<WorkspacePool>(static_cast<DLDeviceType>(kDLVulkan),
+                                           VulkanDeviceAPI::Global())) {
   ctx.device_id = 0;
   ctx.device_type = static_cast<DLDeviceType>(kDLVulkan);
 }
@@ -1142,7 +1159,7 @@ TVM_REGISTER_GLOBAL("runtime.module.loadfile_vulkan").set_body_typed(VulkanModul
 TVM_REGISTER_GLOBAL("runtime.module.loadbinary_vulkan").set_body_typed(VulkanModuleLoadBinary);
 
 TVM_REGISTER_GLOBAL("device_api.vulkan").set_body([](TVMArgs args, TVMRetValue* rv) {
-  DeviceAPI* ptr = VulkanDeviceAPI::Global().get();
+  DeviceAPI* ptr = VulkanDeviceAPI::Global();
   *rv = static_cast<void*>(ptr);
 });
 

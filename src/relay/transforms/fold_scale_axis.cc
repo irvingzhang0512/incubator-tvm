@@ -255,7 +255,7 @@ class ForwardPrep : private ExprVisitor {
     ExprVisitor::VisitExpr_(call);
     // function to be lazily invoked
     auto flazy = [this, call]() {
-      static const auto& fprep = Op::GetAttr<FForwardPrep>("FScaleAxisForwardPrep");
+      static const auto& fprep = Op::GetAttrMap<FForwardPrep>("FScaleAxisForwardPrep");
       // find the message send to this node.
       auto it = message_.find(call);
       Message out_message;
@@ -329,8 +329,7 @@ static Expr ReshapeToMatchAxis(Expr scale, const Array<PrimExpr>& shape,
       arr.push_back(1);
     }
   }
-  return MakeReshape(
-      scale, MakeConstantTensor(DataType::Int(32), {static_cast<int64_t>(arr.size())}, arr));
+  return MakeReshape(scale, std::move(arr));
 }
 
 // if only one axis, use expand dim. Else, use reshape
@@ -625,7 +624,7 @@ class BackwardPrep : private ExprVisitor {
   // Visit the expression.
   void VisitExpr_(const CallNode* call) {
     ExprVisitor::VisitExpr_(call);
-    static const auto& fprep = Op::GetAttr<FBackwardPrep>("FScaleAxisBackwardPrep");
+    static const auto& fprep = Op::GetAttrMap<FBackwardPrep>("FScaleAxisBackwardPrep");
     auto f = fprep.get(call->op, nullptr);
     if (f == nullptr) return;
     auto rit = ref_counter_.find(call);
@@ -727,7 +726,7 @@ class BackwardTransformer : public ObjectRef {
 };
 
 Expr BackwardTransformerNode::Transform(const CallNode* call_node, Message message, Expr scale) {
-  static const auto& ftransform = Op::GetAttr<FBackwardTransform>("FScaleAxisBackwardTransform");
+  static const auto& ftransform = Op::GetAttrMap<FBackwardTransform>("FScaleAxisBackwardTransform");
   auto f = ftransform.get(call_node->op, nullptr);
   if (f != nullptr) {
     const Call call = GetRef<Call>(call_node);

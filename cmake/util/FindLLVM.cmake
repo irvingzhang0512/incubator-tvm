@@ -29,12 +29,22 @@
 # - LLVM_LIBS
 # - LLVM_DEFINITIONS
 # - TVM_LLVM_VERSION
+# - TVM_INFO_LLVM_VERSION
 #
 macro(find_llvm use_llvm)
   set(LLVM_CONFIG ${use_llvm})
   if(LLVM_CONFIG STREQUAL "ON")
     find_package(LLVM REQUIRED CONFIG)
-    llvm_map_components_to_libnames(LLVM_LIBS all)
+    llvm_map_components_to_libnames(LLVM_LIBS "all")
+    if (NOT LLVM_LIBS)
+      message(STATUS "Not found - LLVM_LIBS")
+      message(STATUS "Fall back to using llvm-config")
+      set(LLVM_CONFIG "llvm-config")
+    else()
+      set(LLVM_CONFIG "ON")
+    endif()
+  endif()
+  if(LLVM_CONFIG STREQUAL "ON")
     list (FIND LLVM_LIBS "LLVM" _llvm_dynlib_index)
     if (${_llvm_dynlib_index} GREATER -1)
       set(LLVM_LIBS LLVM)
@@ -44,6 +54,7 @@ macro(find_llvm use_llvm)
       message(STATUS "Link with static LLVM libraries")
     endif()
     set(TVM_LLVM_VERSION ${LLVM_VERSION_MAJOR}${LLVM_VERSION_MINOR})
+    set(TVM_INFO_LLVM_VERSION "${LLVM_VERSION_MAJOR}.${LLVM_VERSION_MINOR}.${LLVM_VERSION_PATCH}")
   elseif(NOT LLVM_CONFIG STREQUAL "OFF")
     # use llvm config
     message(STATUS "Use llvm-config=" ${LLVM_CONFIG})
@@ -73,6 +84,7 @@ macro(find_llvm use_llvm)
       message(FATAL_ERROR "Fatal error executing: ${use_llvm} --version")
     endif()
     # llvm version
+    set(TVM_INFO_LLVM_VERSION ${__llvm_version})
     string(REGEX REPLACE "^([^.]+)\.([^.])+\.[^.]+.*$" "\\1\\2" TVM_LLVM_VERSION ${__llvm_version})
     # definitions
     string(REGEX MATCHALL "(^| )-D[A-Za-z0-9_]*" LLVM_DEFINITIONS ${__llvm_cxxflags})

@@ -24,10 +24,13 @@
 #include <tvm/node/repr_printer.h>
 #include <tvm/runtime/registry.h>
 #include <tvm/target/target.h>
+#include <tvm/target/target_kind.h>
 #include <tvm/tir/expr.h>
 
 #include <algorithm>
 #include <stack>
+
+#include "../runtime/object_internal.h"
 
 namespace tvm {
 
@@ -37,163 +40,263 @@ using runtime::TVMRetValue;
 
 TVM_REGISTER_NODE_TYPE(TargetNode);
 
-TVM_STATIC_IR_FUNCTOR(ReprPrinter, vtable)
-    .set_dispatch<TargetNode>([](const ObjectRef& node, ReprPrinter* p) {
-      auto* op = static_cast<const TargetNode*>(node.get());
-      p->stream << op->str();
-    });
-
-/*!
- * \brief Construct a Target node from the given name and options.
- * \param target_name The major target name. Should be one of
- * {"aocl", "aocl_sw_emu", "c", "cuda", "ext_dev", "hexagon", "hybrid", "llvm",
- *  "metal", "nvptx", "opencl", "rocm", "sdaccel", "stackvm", "vulkan"}
- * \param options Additional options appended to the target
- * \return The constructed Target
- */
-Target CreateTarget(const std::string& target_name, const std::vector<std::string>& options) {
-  auto t = make_object<TargetNode>();
-  t->target_name = target_name;
-
-  std::string libs_flag = "-libs=";
-  std::string device_flag = "-device=";
-  std::string keys_flag = "-keys=";
-  for (auto& item : options) {
-    t->options_array.push_back(item);
-
-    if (item.find(libs_flag) == 0) {
-      std::stringstream ss(item.substr(libs_flag.length()));
-      std::string lib_item;
-      while (std::getline(ss, lib_item, ',')) {
-        t->libs_array.push_back(lib_item);
-      }
-    } else if (item.find(device_flag) == 0) {
-      t->device_name = item.substr(device_flag.length());
-      t->keys_array.push_back(t->device_name);
-    } else if (item.find(keys_flag) == 0) {
-      std::stringstream ss(item.substr(keys_flag.length()));
-      std::string key_item;
-      while (std::getline(ss, key_item, ',')) {
-        t->keys_array.push_back(key_item);
+static std::vector<String> DeduplicateKeys(const std::vector<String>& keys) {
+  std::vector<String> new_keys;
+  for (size_t i = 0; i < keys.size(); ++i) {
+    bool found = false;
+    for (size_t j = 0; j < i; ++j) {
+      if (keys[i] == keys[j]) {
+        found = true;
+        break;
       }
     }
-  }
-
-  if (t->device_name.length() > 0) {
-    t->keys_array.push_back(t->device_name);
-  }
-  t->device_type = kDLCPU;
-  t->thread_warp_size = 1;
-  if (target_name == "c" && t->device_name == "micro_dev") {
-    t->device_type = kDLMicroDev;
-  } else if (target_name == "c" || target_name == "llvm") {
-    t->keys_array.push_back("cpu");
-  } else if (target_name == "cuda" || target_name == "nvptx") {
-    t->device_type = kDLGPU;
-    t->keys_array.push_back("cuda");
-    t->keys_array.push_back("gpu");
-    t->max_num_threads = 1024;
-    t->thread_warp_size = 32;
-  } else if (target_name == "rocm" || target_name == "opencl") {
-    // For now assume rocm schedule for opencl
-    if (target_name == "opencl") {
-      t->device_type = kDLOpenCL;
-    } else {
-      t->device_type = kDLROCM;
+    if (!found) {
+      new_keys.push_back(keys[i]);
     }
-    t->keys_array.push_back(target_name);
-    t->keys_array.push_back("gpu");
-    t->max_num_threads = 256;
-    if (t->device_name == "intel_graphics") {
-      t->thread_warp_size = 16;
-    }
-  } else if (target_name == "metal" || target_name == "vulkan" || target_name == "webgpu") {
-    if (target_name == "metal") {
-      t->device_type = kDLMetal;
-    } else if (target_name == "vulkan") {
-      t->device_type = kDLVulkan;
-    } else {
-      t->device_type = kDLWebGPU;
-    }
-    t->keys_array.push_back(target_name);
-    t->keys_array.push_back("gpu");
-    t->max_num_threads = 256;
-  } else if (target_name == "sdaccel") {
-    t->device_type = kDLOpenCL;
-    t->keys_array.push_back("sdaccel");
-    t->keys_array.push_back("hls");
-  } else if (target_name == "aocl" || target_name == "aocl_sw_emu") {
-    t->device_type = kDLAOCL;
-    t->keys_array.push_back("aocl");
-    t->keys_array.push_back("hls");
-  } else if (target_name == "stackvm") {
-    t->device_type = kDLCPU;
-  } else if (target_name == "ext_dev") {
-    t->device_type = kDLExtDev;
-  } else if (target_name == "hybrid") {
-    t->device_type = kDLCPU;
-  } else if (target_name == "hexagon") {
-    t->keys_array.push_back("hexagon");
-    t->device_type = kDLHexagon;
-  } else if (target_name == "webgpu") {
-    t->keys_array.push_back("webgpu");
-    t->device_type = kDLWebGPU;
-  } else {
-    LOG(ERROR) << "Unknown target name " << target_name << "; falling back to stackvm";
-    return target::stackvm();
   }
-
-  return Target(t);
+  return new_keys;
 }
 
-TVM_REGISTER_GLOBAL("target.TargetCreate").set_body([](TVMArgs args, TVMRetValue* ret) {
-  std::string target_name = args[0];
-  std::vector<std::string> options;
-  for (int i = 1; i < args.num_args; ++i) {
-    std::string arg = args[i];
-    options.push_back(arg);
+static inline std::string RemovePrefixDashes(const std::string& s) {
+  size_t n_dashes = 0;
+  for (; n_dashes < s.length() && s[n_dashes] == '-'; ++n_dashes) {
   }
+  CHECK(0 < n_dashes && n_dashes < s.size()) << "ValueError: Not an attribute key \"" << s << "\"";
+  return s.substr(n_dashes);
+}
 
-  *ret = CreateTarget(target_name, options);
-});
+static inline int FindUniqueSubstr(const std::string& str, const std::string& substr) {
+  size_t pos = str.find_first_of(substr);
+  if (pos == std::string::npos) {
+    return -1;
+  }
+  size_t next_pos = pos + substr.size();
+  CHECK(next_pos >= str.size() || str.find_first_of(substr, next_pos) == std::string::npos)
+      << "ValueError: At most one \"" << substr << "\" is allowed in "
+      << "the the given string \"" << str << "\"";
+  return pos;
+}
 
-TVM_REGISTER_GLOBAL("target.TargetFromString").set_body([](TVMArgs args, TVMRetValue* ret) {
-  std::string target_str = args[0];
-  *ret = Target::Create(target_str);
-});
+static inline ObjectRef ParseAtomicType(uint32_t type_index, const std::string& str) {
+  std::istringstream is(str);
+  if (type_index == Integer::ContainerType::_GetOrAllocRuntimeTypeIndex()) {
+    int v;
+    is >> v;
+    return is.fail() ? ObjectRef(nullptr) : Integer(v);
+  } else if (type_index == String::ContainerType::_GetOrAllocRuntimeTypeIndex()) {
+    std::string v;
+    is >> v;
+    return is.fail() ? ObjectRef(nullptr) : String(v);
+  }
+  return ObjectRef(nullptr);
+}
 
-std::vector<std::string> TargetNode::keys() const {
+Map<String, ObjectRef> TargetNode::ParseAttrsFromRaw(
+    const std::vector<std::string>& options) const {
+  std::unordered_map<String, ObjectRef> attrs;
+  for (size_t iter = 0, end = options.size(); iter < end;) {
+    // remove the prefix dashes
+    std::string s = RemovePrefixDashes(options[iter++]);
+    // parse name-obj pair
+    std::string name;
+    std::string obj;
+    int pos;
+    if ((pos = FindUniqueSubstr(s, "=")) != -1) {
+      // case 1. --key=value
+      name = s.substr(0, pos);
+      obj = s.substr(pos + 1);
+      CHECK(!name.empty()) << "ValueError: Empty attribute key in \"" << options[iter - 1] << "\"";
+      CHECK(!obj.empty()) << "ValueError: Empty attribute in \"" << options[iter - 1] << "\"";
+    } else if (iter < end && options[iter][0] != '-') {
+      // case 2. --key value
+      name = s;
+      obj = options[iter++];
+    } else {
+      // case 3. --boolean-key
+      name = s;
+      obj = "1";
+    }
+    // check if `name` is invalid
+    auto it = this->kind->key2vtype_.find(name);
+    if (it == this->kind->key2vtype_.end()) {
+      std::ostringstream os;
+      os << "AttributeError: Invalid config option, cannot recognize \'" << name
+         << "\'. Candidates are:";
+      for (const auto& kv : this->kind->key2vtype_) {
+        os << "\n  " << kv.first;
+      }
+      LOG(FATAL) << os.str();
+    }
+    // check if `name` has been set once
+    CHECK(!attrs.count(name)) << "AttributeError: key \"" << name
+                              << "\" appears more than once in the target string";
+    // then `name` is valid, let's parse them
+    // only several types are supported when parsing raw string
+    const auto& info = it->second;
+    ObjectRef parsed_obj(nullptr);
+    if (info.type_index != ArrayNode::_type_index) {
+      parsed_obj = ParseAtomicType(info.type_index, obj);
+    } else {
+      Array<ObjectRef> array;
+      std::string item;
+      bool failed = false;
+      uint32_t type_index = info.key->type_index;
+      for (std::istringstream is(obj); std::getline(is, item, ',');) {
+        ObjectRef parsed_obj = ParseAtomicType(type_index, item);
+        if (parsed_obj.defined()) {
+          array.push_back(parsed_obj);
+        } else {
+          failed = true;
+          break;
+        }
+      }
+      if (!failed) {
+        parsed_obj = std::move(array);
+      }
+    }
+    if (!parsed_obj.defined()) {
+      LOG(FATAL) << "ValueError: Cannot parse type \"" << info.type_key << "\""
+                 << ", where attribute key is \"" << name << "\""
+                 << ", and attribute is \"" << obj << "\"";
+    }
+    attrs[name] = std::move(parsed_obj);
+  }
+  // set default attribute values if they do not exist
+  for (const auto& kv : this->kind->key2default_) {
+    if (!attrs.count(kv.first)) {
+      attrs[kv.first] = kv.second;
+    }
+  }
+  return attrs;
+}
+
+static inline Optional<String> StringifyAtomicType(const ObjectRef& obj) {
+  if (const auto* p = obj.as<IntImmNode>()) {
+    return String(std::to_string(p->value));
+  }
+  if (const auto* p = obj.as<StringObj>()) {
+    return GetRef<String>(p);
+  }
+  return NullOpt;
+}
+
+static inline Optional<String> JoinString(const std::vector<String>& array, char separator) {
+  if (array.empty()) {
+    return NullOpt;
+  }
+  std::ostringstream os;
+  os << array[0];
+  for (size_t i = 1; i < array.size(); ++i) {
+    os << separator << array[i];
+  }
+  return String(os.str());
+}
+
+Optional<String> TargetNode::StringifyAttrsToRaw(const Map<String, ObjectRef>& attrs) const {
+  std::ostringstream os;
+  std::vector<String> keys;
+  for (const auto& kv : attrs) {
+    keys.push_back(kv.first);
+  }
+  std::sort(keys.begin(), keys.end());
+  std::vector<String> result;
+  for (const auto& key : keys) {
+    const ObjectRef& obj = attrs[key];
+    Optional<String> value = NullOpt;
+    if (const auto* array = obj.as<ArrayNode>()) {
+      std::vector<String> items;
+      for (const ObjectRef& item : *array) {
+        Optional<String> str = StringifyAtomicType(item);
+        if (str.defined()) {
+          items.push_back(str.value());
+        } else {
+          items.clear();
+          break;
+        }
+      }
+      value = JoinString(items, ',');
+    } else {
+      value = StringifyAtomicType(obj);
+    }
+    if (value.defined()) {
+      result.push_back("-" + key + "=" + value.value());
+    }
+  }
+  return JoinString(result, ' ');
+}
+
+Target Target::CreateTarget(const std::string& name, const std::vector<std::string>& options) {
+  TargetKind kind = TargetKind::Get(name);
+  ObjectPtr<TargetNode> target = make_object<TargetNode>();
+  target->kind = kind;
+  // tag is always empty
+  target->tag = "";
+  // parse attrs
+  target->attrs = target->ParseAttrsFromRaw(options);
+  String device_name = target->GetAttr<String>("device", "").value();
+  // set up keys
+  {
+    std::vector<String> keys;
+    // user provided keys
+    if (Optional<Array<String>> user_keys = target->GetAttr<Array<String>>("keys")) {
+      keys = std::vector<String>(user_keys.value().begin(), user_keys.value().end());
+      target->attrs.erase("keys");
+    }
+    // add `device_name`
+    if (!device_name.empty()) {
+      keys.push_back(device_name);
+    }
+    // add default keys
+    for (const auto& key : target->kind->default_keys) {
+      keys.push_back(key);
+    }
+    // de-duplicate keys
+    target->keys = DeduplicateKeys(keys);
+  }
+  return Target(target);
+}
+
+std::vector<std::string> TargetNode::GetKeys() const {
   std::vector<std::string> result;
-  for (auto& expr : keys_array) {
+  for (auto& expr : keys) {
     result.push_back(expr);
   }
   return result;
 }
 
-std::vector<std::string> TargetNode::options() const {
-  std::vector<std::string> result;
-  for (auto& expr : options_array) {
-    result.push_back(expr);
+std::unordered_set<std::string> TargetNode::GetLibs() const {
+  Optional<Array<String>> libs = this->GetAttr<Array<String>>("libs");
+  if (!libs.defined()) {
+    return {};
   }
-  return result;
-}
-
-std::unordered_set<std::string> TargetNode::libs() const {
   std::unordered_set<std::string> result;
-  for (auto& expr : libs_array) {
-    result.insert(expr);
+  for (const auto& item : libs.value()) {
+    result.insert(item);
   }
   return result;
 }
 
 const std::string& TargetNode::str() const {
-  if (str_repr_.length() != 0) return str_repr_;
-  std::ostringstream result;
-  result << target_name;
-  for (const auto& x : options()) {
-    result << " " << x;
+  if (str_repr_.empty()) {
+    std::ostringstream os;
+    os << kind->name;
+    if (!this->keys.empty()) {
+      os << " -keys=";
+      bool is_first = true;
+      for (const String& s : keys) {
+        if (is_first) {
+          is_first = false;
+        } else {
+          os << ',';
+        }
+        os << s;
+      }
+    }
+    if (Optional<String> attrs_str = this->StringifyAttrsToRaw(attrs)) {
+      os << ' ' << attrs_str.value();
+    }
+    str_repr_ = os.str();
   }
-  str_repr_ = result.str();
   return str_repr_;
 }
 
@@ -201,39 +304,168 @@ bool StartsWith(const std::string& str, const std::string& pattern) {
   return str.compare(0, pattern.length(), pattern) == 0;
 }
 
-std::string GetDeviceName(const std::string& target_str) {
-  std::istringstream ss(target_str);
-  std::string target_name;
-  ss >> target_name;
-
-  std::string item;
-  while (ss >> item) {
-    if (StartsWith(item, "-device=")) {
-      return item.substr(std::string("-device=").length());
-    }
+Target Target::Create(const String& target_str) {
+  std::vector<std::string> splits;
+  std::istringstream is(target_str);
+  for (std::string s; is >> s; splits.push_back(s)) {
   }
-
-  return "";
+  CHECK(!splits.empty()) << "ValueError: Cannot parse empty target string: \"" << target_str
+                         << "\"";
+  return CreateTarget(splits[0], {splits.begin() + 1, splits.end()});
 }
 
-Target Target::Create(const std::string& target_str) {
-  if (target_str.length() == 0) {
-    LOG(ERROR) << "target_str must not be empty";
+ObjectRef TargetNode::ParseAttr(const ObjectRef& obj,
+                                const TargetKindNode::ValueTypeInfo& info) const {
+  if (info.type_index == Integer::ContainerType::_GetOrAllocRuntimeTypeIndex()) {
+    const auto* v = obj.as<IntImmNode>();
+    CHECK(v != nullptr) << "Expect type 'int', but get: " << obj->GetTypeKey();
+    return GetRef<Integer>(v);
   }
-
-  std::istringstream ss(target_str);
-  std::string target_name;
-
-  ss >> target_name;
-  auto device_name = GetDeviceName(target_str);
-
-  std::vector<std::string> options;
-  std::string item;
-  while (ss >> item) {
-    options.push_back(item);
+  if (info.type_index == String::ContainerType::_GetOrAllocRuntimeTypeIndex()) {
+    const auto* v = obj.as<StringObj>();
+    CHECK(v != nullptr) << "Expect type 'str', but get: " << obj->GetTypeKey();
+    return GetRef<String>(v);
   }
+  if (info.type_index == Target::ContainerType::_GetOrAllocRuntimeTypeIndex()) {
+    CHECK(obj->IsInstance<MapNode>())
+        << "Expect type 'dict' to construct Target, but get: " << obj->GetTypeKey();
+    return Target::FromConfig(Downcast<Map<String, ObjectRef>>(obj));
+  }
+  if (info.type_index == ArrayNode::_GetOrAllocRuntimeTypeIndex()) {
+    CHECK(obj->IsInstance<ArrayNode>()) << "Expect type 'list', but get: " << obj->GetTypeKey();
+    Array<ObjectRef> array = Downcast<Array<ObjectRef>>(obj);
+    std::vector<ObjectRef> result;
+    int i = 0;
+    for (const ObjectRef& e : array) {
+      ++i;
+      try {
+        result.push_back(TargetNode::ParseAttr(e, *info.key));
+      } catch (const dmlc::Error& e) {
+        LOG(FATAL) << "Error occurred when parsing element " << i << " of the array: " << array
+                   << ". Details:\n"
+                   << e.what();
+      }
+    }
+    return Array<ObjectRef>(result);
+  }
+  if (info.type_index == MapNode::_GetOrAllocRuntimeTypeIndex()) {
+    CHECK(obj->IsInstance<MapNode>()) << "Expect type 'dict', but get: " << obj->GetTypeKey();
+    std::unordered_map<ObjectRef, ObjectRef, ObjectHash, ObjectEqual> result;
+    for (const auto& kv : Downcast<Map<ObjectRef, ObjectRef>>(obj)) {
+      ObjectRef key, val;
+      try {
+        key = TargetNode::ParseAttr(kv.first, *info.key);
+      } catch (const tvm::Error& e) {
+        LOG(FATAL) << "Error occurred when parsing a key of the dict: " << kv.first
+                   << ". Details:\n"
+                   << e.what();
+      }
+      try {
+        val = TargetNode::ParseAttr(kv.second, *info.val);
+      } catch (const tvm::Error& e) {
+        LOG(FATAL) << "Error occurred when parsing a value of the dict: " << kv.second
+                   << ". Details:\n"
+                   << e.what();
+      }
+      result[key] = val;
+    }
+    return Map<ObjectRef, ObjectRef>(result);
+  }
+  LOG(FATAL) << "Unsupported type registered: \"" << info.type_key
+             << "\", and the type given is: " << obj->GetTypeKey();
+  throw;
+}
 
-  return CreateTarget(target_name, options);
+Target Target::FromConfig(const Map<String, ObjectRef>& config_dict) {
+  const String kKind = "kind";
+  const String kTag = "tag";
+  const String kKeys = "keys";
+  const String kDeviceName = "device";
+  std::unordered_map<std::string, ObjectRef> config(config_dict.begin(), config_dict.end());
+  ObjectPtr<TargetNode> target = make_object<TargetNode>();
+  // parse 'kind'
+  if (config.count(kKind)) {
+    const auto* kind = config[kKind].as<StringObj>();
+    CHECK(kind != nullptr) << "AttributeError: Expect type of field 'kind' is string, but get: "
+                           << config[kKind]->GetTypeKey();
+    target->kind = TargetKind::Get(GetRef<String>(kind));
+    config.erase(kKind);
+  } else {
+    LOG(FATAL) << "AttributeError: Field 'kind' is not found";
+  }
+  // parse "tag"
+  if (config.count(kTag)) {
+    const auto* tag = config[kTag].as<StringObj>();
+    CHECK(tag != nullptr) << "AttributeError: Expect type of field 'tag' is string, but get: "
+                          << config[kTag]->GetTypeKey();
+    target->tag = GetRef<String>(tag);
+    config.erase(kTag);
+  } else {
+    target->tag = "";
+  }
+  // parse "keys"
+  if (config.count(kKeys)) {
+    std::vector<String> keys;
+    // user provided keys
+    const auto* cfg_keys = config[kKeys].as<ArrayNode>();
+    CHECK(cfg_keys != nullptr)
+        << "AttributeError: Expect type of field 'keys' is an Array, but get: "
+        << config[kTag]->GetTypeKey();
+    for (const ObjectRef& e : *cfg_keys) {
+      const auto* key = e.as<StringObj>();
+      CHECK(key != nullptr) << "AttributeError: Expect 'keys' to be an array of strings, but it "
+                               "contains an element of type: "
+                            << e->GetTypeKey();
+      keys.push_back(GetRef<String>(key));
+    }
+    // add device name
+    if (config_dict.count(kDeviceName)) {
+      if (const auto* device = config_dict.at(kDeviceName).as<StringObj>()) {
+        keys.push_back(GetRef<String>(device));
+      }
+    }
+    // add default keys
+    for (const auto& key : target->kind->default_keys) {
+      keys.push_back(key);
+    }
+    // de-duplicate keys
+    target->keys = DeduplicateKeys(keys);
+    config.erase(kKeys);
+  } else {
+    target->keys = {};
+  }
+  // parse attrs
+  std::unordered_map<String, ObjectRef> attrs;
+  const auto& key2vtype = target->kind->key2vtype_;
+  for (const auto& cfg_kv : config) {
+    const String& name = cfg_kv.first;
+    const ObjectRef& obj = cfg_kv.second;
+    if (!key2vtype.count(name)) {
+      std::ostringstream os;
+      os << "AttributeError: Unrecognized config option: \"" << name << "\". Candidates are:";
+      for (const auto& kv : key2vtype) {
+        os << " " << kv.first;
+      }
+      LOG(FATAL) << os.str();
+    }
+    ObjectRef val;
+    try {
+      val = target->ParseAttr(obj, key2vtype.at(name));
+    } catch (const dmlc::Error& e) {
+      LOG(FATAL) << "AttributeError: Error occurred in parsing the config key \"" << name
+                 << "\". Details:\n"
+                 << e.what();
+    }
+    attrs[name] = val;
+  }
+  // set default attribute values if they do not exist
+  for (const auto& kv : target->kind->key2default_) {
+    if (!attrs.count(kv.first)) {
+      attrs[kv.first] = kv.second;
+    }
+  }
+  target->attrs = attrs;
+  return Target(target);
 }
 
 /*! \brief Entry to hold the Target context stack. */
@@ -243,7 +475,7 @@ struct TVMTargetThreadLocalEntry {
 };
 
 /*! \brief Thread local store to hold the Target context stack. */
-typedef dmlc::ThreadLocalStore<TVMTargetThreadLocalEntry> TVMTargetThreadLocalStore;
+using TVMTargetThreadLocalStore = dmlc::ThreadLocalStore<TVMTargetThreadLocalEntry>;
 
 void Target::EnterWithScope() {
   TVMTargetThreadLocalEntry* entry = TVMTargetThreadLocalStore::Get();
@@ -268,19 +500,36 @@ tvm::Target Target::Current(bool allow_not_defined) {
   return Target();
 }
 
-TVM_REGISTER_GLOBAL("target.GetCurrentTarget").set_body([](TVMArgs args, TVMRetValue* ret) {
-  bool allow_not_defined = args[0];
-  *ret = Target::Current(allow_not_defined);
-});
 class Target::Internal {
  public:
   static void EnterScope(Target target) { target.EnterWithScope(); }
   static void ExitScope(Target target) { target.ExitWithScope(); }
 };
 
+TVM_REGISTER_GLOBAL("target.TargetCreate").set_body([](TVMArgs args, TVMRetValue* ret) {
+  std::string name = args[0];
+  std::vector<std::string> options;
+  for (int i = 1; i < args.num_args; ++i) {
+    std::string arg = args[i];
+    options.push_back(arg);
+  }
+
+  *ret = Target::CreateTarget(name, options);
+});
+
 TVM_REGISTER_GLOBAL("target.EnterTargetScope").set_body_typed(Target::Internal::EnterScope);
 
 TVM_REGISTER_GLOBAL("target.ExitTargetScope").set_body_typed(Target::Internal::ExitScope);
+
+TVM_REGISTER_GLOBAL("target.GetCurrentTarget").set_body_typed(Target::Current);
+
+TVM_REGISTER_GLOBAL("target.TargetFromString").set_body_typed(Target::Create);
+
+TVM_STATIC_IR_FUNCTOR(ReprPrinter, vtable)
+    .set_dispatch<TargetNode>([](const ObjectRef& node, ReprPrinter* p) {
+      auto* op = static_cast<const TargetNode*>(node.get());
+      p->stream << op->str();
+    });
 
 namespace target {
 std::vector<std::string> MergeOptions(std::vector<std::string> opts,
@@ -289,138 +538,45 @@ std::vector<std::string> MergeOptions(std::vector<std::string> opts,
   return opts;
 }
 
-Target llvm(const std::vector<std::string>& options) { return CreateTarget("llvm", options); }
+Target llvm(const std::vector<std::string>& options) {
+  return Target::CreateTarget("llvm", options);
+}
 
-Target cuda(const std::vector<std::string>& options) { return CreateTarget("cuda", options); }
+Target cuda(const std::vector<std::string>& options) {
+  return Target::CreateTarget("cuda", options);
+}
 
-Target rocm(const std::vector<std::string>& options) { return CreateTarget("rocm", options); }
+Target rocm(const std::vector<std::string>& options) {
+  return Target::CreateTarget("rocm", options);
+}
 
-Target opencl(const std::vector<std::string>& options) { return CreateTarget("opencl", options); }
+Target opencl(const std::vector<std::string>& options) {
+  return Target::CreateTarget("opencl", options);
+}
 
-Target metal(const std::vector<std::string>& options) { return CreateTarget("metal", options); }
+Target metal(const std::vector<std::string>& options) {
+  return Target::CreateTarget("metal", options);
+}
 
 Target mali(const std::vector<std::string>& options) {
-  return CreateTarget("opencl", MergeOptions(options, {"-device=mali"}));
+  return Target::CreateTarget("opencl", MergeOptions(options, {"-device=mali"}));
 }
 
 Target intel_graphics(const std::vector<std::string>& options) {
-  return CreateTarget("opencl", MergeOptions(options, {"-device=intel_graphics"}));
+  return Target::CreateTarget(
+      "opencl", MergeOptions(options, {"-device=intel_graphics", "-thread_warp_size=16"}));
 }
 
-Target stackvm(const std::vector<std::string>& options) { return CreateTarget("stackvm", options); }
+Target stackvm(const std::vector<std::string>& options) {
+  return Target::CreateTarget("stackvm", options);
+}
 
-Target ext_dev(const std::vector<std::string>& options) { return CreateTarget("ext_dev", options); }
+Target ext_dev(const std::vector<std::string>& options) {
+  return Target::CreateTarget("ext_dev", options);
+}
 
-Target hexagon(const std::vector<std::string>& options) { return CreateTarget("hexagon", options); }
+Target hexagon(const std::vector<std::string>& options) {
+  return Target::CreateTarget("hexagon", options);
+}
 }  // namespace target
-
-BuildConfig BuildConfig::Create() { return BuildConfig(make_object<BuildConfigNode>()); }
-
-/*! \brief Entry to hold the BuildConfig context stack. */
-struct TVMBuildConfigThreadLocalEntry {
-  /*! \brief The default build config if the stack is empty */
-  BuildConfig default_config;
-
-  /*! \brief The current build config context */
-  std::stack<BuildConfig> context_stack;
-
-  TVMBuildConfigThreadLocalEntry() : default_config(BuildConfig::Create()) {}
-};
-
-/*! \brief Thread local store to hold the BuildConfig context stack. */
-typedef dmlc::ThreadLocalStore<TVMBuildConfigThreadLocalEntry> TVMBuildConfigThreadLocalStore;
-
-void BuildConfig::EnterWithScope() {
-  TVMBuildConfigThreadLocalEntry* entry = TVMBuildConfigThreadLocalStore::Get();
-  entry->context_stack.push(*this);
-}
-
-void BuildConfig::ExitWithScope() {
-  TVMBuildConfigThreadLocalEntry* entry = TVMBuildConfigThreadLocalStore::Get();
-  CHECK(!entry->context_stack.empty());
-  CHECK(entry->context_stack.top().same_as(*this));
-  entry->context_stack.pop();
-}
-
-tvm::BuildConfig BuildConfig::Current() {
-  TVMBuildConfigThreadLocalEntry* entry = TVMBuildConfigThreadLocalStore::Get();
-  if (entry->context_stack.size() > 0) {
-    return entry->context_stack.top();
-  }
-
-  return entry->default_config;
-}
-
-TVM_REGISTER_NODE_TYPE(BuildConfigNode);
-
-TVM_STATIC_IR_FUNCTOR(ReprPrinter, vtable)
-    .set_dispatch<BuildConfigNode>([](const ObjectRef& node, ReprPrinter* p) {
-      auto* op = static_cast<const BuildConfigNode*>(node.get());
-      p->stream << "build_config(";
-      p->stream << "data_alignment=" << op->data_alignment << ", ";
-      p->stream << "offset_factor=" << op->offset_factor << ", ";
-      p->stream << "double_buffer_split_loop=" << op->double_buffer_split_loop << ", ";
-      p->stream << "auto_unroll_max_step=" << op->auto_unroll_max_step << ", ";
-      p->stream << "auto_unroll_max_depth=" << op->auto_unroll_max_depth << ", ";
-      p->stream << "auto_unroll_max_extent=" << op->auto_unroll_max_extent << ", ";
-      p->stream << "unroll_explicit=" << op->unroll_explicit << ", ";
-      p->stream << "restricted_func=" << op->restricted_func << ", ";
-      p->stream << "detect_global_barrier=" << op->detect_global_barrier << ", ";
-      p->stream << "partition_const_loop=" << op->partition_const_loop << ", ";
-      p->stream << "dump_pass_ir=" << op->dump_pass_ir << ", ";
-      p->stream << "instrument_bound_checkers=" << op->instrument_bound_checkers << ", ";
-      p->stream << "disable_select_rewriting=" << op->disable_select_rewriting;
-      p->stream << "disable_vectorize=" << op->disable_vectorize;
-      p->stream << "disable_assert=" << op->disable_assert;
-      p->stream << ")";
-    });
-
-TVM_REGISTER_GLOBAL("target.GetCurrentBuildConfig").set_body([](TVMArgs args, TVMRetValue* ret) {
-  *ret = BuildConfig::Current();
-});
-
-class BuildConfig::Internal {
- public:
-  static void EnterScope(BuildConfig target) { target.EnterWithScope(); }
-  static void ExitScope(BuildConfig target) { target.ExitWithScope(); }
-};
-
-TVM_REGISTER_GLOBAL("target.EnterBuildConfigScope")
-    .set_body_typed(BuildConfig::Internal::EnterScope);
-
-TVM_REGISTER_GLOBAL("target.ExitBuildConfigScope").set_body_typed(BuildConfig::Internal::ExitScope);
-
-TVM_REGISTER_GLOBAL("target.BuildConfigSetAddLowerPass")
-    .set_body([](TVMArgs args, TVMRetValue* ret) {
-      BuildConfig cfg = args[0];
-      std::vector<std::pair<int, transform::Pass>> add_lower_pass;
-      CHECK_EQ(args.size() % 2, 1);
-      for (int i = 1; i < args.size(); i += 2) {
-        add_lower_pass.push_back(
-            std::make_pair(args[i].operator int(), args[i + 1].operator transform::Pass()));
-      }
-      cfg->add_lower_pass = add_lower_pass;
-    });
-
-TVM_REGISTER_GLOBAL("target.BuildConfigGetAddLowerPassInfo")
-    .set_body([](TVMArgs args, TVMRetValue* ret) {
-      // Return one of the following:
-      //  * Size of add_lower_pass if num_args == 1
-      //  * Phase index of pass if args are (config, index, true)
-      //  * Function of pass if args are (config, index, false)
-      BuildConfig cfg = args[0];
-      if (args.num_args == 1) {
-        *ret = static_cast<int64_t>(cfg->add_lower_pass.size());
-      } else {
-        int index = args[1];
-        bool get_phase = args[2];
-        auto item = cfg->add_lower_pass[index];
-        if (get_phase) {
-          *ret = item.first;
-        } else {
-          *ret = item.second;
-        }
-      }
-    });
-
 }  // namespace tvm

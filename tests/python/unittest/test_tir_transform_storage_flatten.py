@@ -44,7 +44,7 @@ def test_flatten_prefetch():
     _A= tvm.tir.decl_buffer(A.shape, A.dtype, name = 'A');
     i = te.size_var('i')
     j = te.size_var('j')
-    region = [tvm.ir.Range.make_by_min_extent(i[0], i[1]) for i in [(i, 2), (j, 8), (0, 4)]]
+    region = [tvm.ir.Range.from_min_extent(i[0], i[1]) for i in [(i, 2), (j, 8), (0, 4)]]
     stmt = tvm.tir.Prefetch(_A, region)
 
     func = tvm.te.schedule.SchedulePostProcToPrimFunc(
@@ -106,10 +106,14 @@ def test_flatten_double_buffer():
     mod = tvm.IRModule.from_expr(
         tvm.tir.PrimFunc([A, C], stmt))
 
-    mod = tvm.transform.Sequential([
-        tvm.tir.transform.StorageFlatten(64),
-        tvm.tir.transform.InjectDoubleBuffer(2),
-        tvm.tir.transform.Simplify()])(mod)
+
+    with tvm.transform.PassContext(config={
+        "tir.InjectDoubleBuffer" : {"split_loop" : 2}
+    }):
+        mod = tvm.transform.Sequential([
+            tvm.tir.transform.StorageFlatten(64),
+            tvm.tir.transform.InjectDoubleBuffer(),
+            tvm.tir.transform.Simplify()])(mod)
 
     stmt = mod["main"].body
     assert isinstance(stmt.body.body, tvm.tir.Allocate)
@@ -121,7 +125,7 @@ def test_flatten_double_buffer():
 
     count = [0]
     def count_sync(op):
-        if isinstance(op, tvm.tir.Call) and op.name == "tvm_storage_sync":
+        if isinstance(op, tvm.tir.Call) and  op.op.same_as(tvm.ir.Op.get("tir.tvm_storage_sync")):
             count[0] += 1
     tvm.tir.stmt_functor.post_order_visit(f.body, count_sync)
     assert count[0] == 4

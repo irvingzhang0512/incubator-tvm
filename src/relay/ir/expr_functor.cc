@@ -142,7 +142,8 @@ void MixedModeVisitor::VisitExpr_(const TupleGetItemNode* op) {}
 
 void MixedModeMutator::VisitLeaf(const Expr& expr) {
   if (!memo_.count(expr)) {
-    this->DispatchVisitExpr(expr);
+    Expr ret = this->DispatchVisitExpr(expr);
+    memo_[expr] = ret;
   }
 }
 
@@ -163,9 +164,7 @@ Expr MixedModeMutator::VisitExpr(const Expr& expr) {
     return memo_[expr];
   } else {
     ExpandDataflow(expr, fcheck_visited, fvisit_leaf);
-    Expr ret = this->DispatchVisitExpr(expr);
-    memo_[expr] = ret;
-    return ret;
+    return memo_[expr];
   }
 }
 
@@ -200,7 +199,7 @@ Expr ExprMutator::VisitExpr_(const VarNode* op) {
   if (op->type_annotation.defined()) {
     auto type = this->VisitType(op->type_annotation);
     if (!op->type_annotation.same_as(type)) {
-      return Var(op->vid, type);
+      return Var(op->vid, type, op->span);
     }
   }
   // default case return self.
@@ -225,7 +224,7 @@ Expr ExprMutator::VisitExpr_(const TupleNode* op) {
   if (all_fields_unchanged) {
     return GetRef<Expr>(op);
   } else {
-    return Tuple(fields);
+    return Tuple(fields, op->span);
   }
 }
 
@@ -254,7 +253,7 @@ Expr ExprMutator::VisitExpr_(const FunctionNode* op) {
       body.same_as(op->body)) {
     return GetRef<Expr>(op);
   } else {
-    return Function(params, body, ret_type, ty_params, op->attrs);
+    return Function(params, body, ret_type, ty_params, op->attrs, op->span);
   }
 }
 
@@ -279,7 +278,7 @@ Expr ExprMutator::VisitExpr_(const CallNode* call_node) {
   if (unchanged) {
     return GetRef<Expr>(call_node);
   } else {
-    return Call(new_op, call_args, call_node->attrs, ty_args);
+    return Call(new_op, call_args, call_node->attrs, ty_args, call_node->span);
   }
 }
 
@@ -291,7 +290,7 @@ Expr ExprMutator::VisitExpr_(const LetNode* op) {
   if (var.same_as(op->var) && value.same_as(op->value) && body.same_as(op->body)) {
     return GetRef<Expr>(op);
   } else {
-    return Let(var, value, body);
+    return Let(var, value, body, op->span);
   }
 }
 
@@ -303,16 +302,16 @@ Expr ExprMutator::VisitExpr_(const IfNode* op) {
       op->false_branch.same_as(false_b)) {
     return GetRef<Expr>(op);
   } else {
-    return If(guard, true_b, false_b);
+    return If(guard, true_b, false_b, op->span);
   }
 }
 
-Expr ExprMutator::VisitExpr_(const TupleGetItemNode* g) {
-  auto t = this->Mutate(g->tuple);
-  if (g->tuple == t) {
-    return GetRef<Expr>(g);
+Expr ExprMutator::VisitExpr_(const TupleGetItemNode* get_item) {
+  auto t = this->Mutate(get_item->tuple);
+  if (get_item->tuple == t) {
+    return GetRef<Expr>(get_item);
   } else {
-    return TupleGetItem(t, g->index);
+    return TupleGetItem(t, get_item->index, get_item->span);
   }
 }
 
@@ -321,7 +320,7 @@ Expr ExprMutator::VisitExpr_(const RefCreateNode* op) {
   if (value.same_as(op->value)) {
     return GetRef<Expr>(op);
   } else {
-    return RefCreate(value);
+    return RefCreate(value, op->span);
   }
 }
 
@@ -330,7 +329,7 @@ Expr ExprMutator::VisitExpr_(const RefReadNode* op) {
   if (ref.same_as(op->ref)) {
     return GetRef<Expr>(op);
   } else {
-    return RefRead(ref);
+    return RefRead(ref, op->span);
   }
 }
 
@@ -340,23 +339,36 @@ Expr ExprMutator::VisitExpr_(const RefWriteNode* op) {
   if (ref.same_as(op->ref) && value.same_as(op->value)) {
     return GetRef<Expr>(op);
   } else {
-    return RefWrite(ref, value);
+    return RefWrite(ref, value, op->span);
   }
 }
 
 Expr ExprMutator::VisitExpr_(const ConstructorNode* c) { return GetRef<Expr>(c); }
 
 Expr ExprMutator::VisitExpr_(const MatchNode* m) {
+  bool unchanged = true;
   std::vector<Clause> clauses;
   for (const Clause& p : m->clauses) {
-    clauses.push_back(VisitClause(p));
+    Clause c = VisitClause(p);
+    clauses.push_back(c);
+    unchanged &= c.same_as(p);
   }
-  return Match(Mutate(m->data), clauses, m->complete);
+  Expr data = Mutate(m->data);
+  unchanged &= data.same_as(m->data);
+
+  if (unchanged) {
+    return GetRef<Expr>(m);
+  }
+  return Match(data, clauses, m->complete, m->span);
 }
 
 Clause ExprMutator::VisitClause(const Clause& c) {
   Pattern p = VisitPattern(c->lhs);
-  return Clause(p, Mutate(c->rhs));
+  Expr rhs = Mutate(c->rhs);
+  if (p.same_as(c->lhs) && rhs.same_as(c->rhs)) {
+    return c;
+  }
+  return Clause(p, rhs);
 }
 
 Pattern ExprMutator::VisitPattern(const Pattern& p) { return p; }
@@ -374,23 +386,26 @@ void ExprVisitor::VisitExpr(const Expr& expr) {
   }
 }
 
-void ExprVisitor::ExprVisitor::VisitExpr_(const VarNode* op) {
+void ExprVisitor::VisitExpr_(const VarNode* op) {
+  this->VisitSpan(op->span);
   if (op->type_annotation.defined()) {
     this->VisitType(op->type_annotation);
   }
 }
 
-void ExprVisitor::ExprVisitor::VisitExpr_(const GlobalVarNode* op) {}
+void ExprVisitor::VisitExpr_(const GlobalVarNode* op) { this->VisitSpan(op->span); }
 
-void ExprVisitor::ExprVisitor::VisitExpr_(const ConstantNode* op) {}
+void ExprVisitor::VisitExpr_(const ConstantNode* op) { this->VisitSpan(op->span); }
 
-void ExprVisitor::ExprVisitor::VisitExpr_(const TupleNode* op) {
+void ExprVisitor::VisitExpr_(const TupleNode* op) {
+  this->VisitSpan(op->span);
   for (auto field : op->fields) {
     this->VisitExpr(field);
   }
 }
 
-void ExprVisitor::ExprVisitor::VisitExpr_(const FunctionNode* op) {
+void ExprVisitor::VisitExpr_(const FunctionNode* op) {
+  this->VisitSpan(op->span);
   for (auto param : op->params) {
     this->VisitExpr(param);
   }
@@ -399,6 +414,7 @@ void ExprVisitor::ExprVisitor::VisitExpr_(const FunctionNode* op) {
 }
 
 void ExprVisitor::VisitExpr_(const CallNode* op) {
+  this->VisitSpan(op->span);
   this->VisitExpr(op->op);
 
   for (auto ty_arg : op->type_args) {
@@ -411,12 +427,14 @@ void ExprVisitor::VisitExpr_(const CallNode* op) {
 }
 
 void ExprVisitor::VisitExpr_(const LetNode* op) {
+  this->VisitSpan(op->span);
   this->VisitExpr(op->value);
   this->VisitExpr(op->var);
   this->VisitExpr(op->body);
 }
 
 void ExprVisitor::VisitExpr_(const IfNode* op) {
+  this->VisitSpan(op->span);
   this->VisitExpr(op->cond);
   this->VisitExpr(op->true_branch);
   this->VisitExpr(op->false_branch);
@@ -424,18 +442,29 @@ void ExprVisitor::VisitExpr_(const IfNode* op) {
 
 void ExprVisitor::VisitExpr_(const OpNode* op) { return; }
 
-void ExprVisitor::VisitExpr_(const TupleGetItemNode* op) { this->VisitExpr(op->tuple); }
+void ExprVisitor::VisitExpr_(const TupleGetItemNode* op) {
+  this->VisitSpan(op->span);
+  this->VisitExpr(op->tuple);
+}
 
-void ExprVisitor::ExprVisitor::VisitExpr_(const RefCreateNode* op) { this->VisitExpr(op->value); }
+void ExprVisitor::VisitExpr_(const RefCreateNode* op) {
+  this->VisitSpan(op->span);
+  this->VisitExpr(op->value);
+}
 
-void ExprVisitor::ExprVisitor::VisitExpr_(const RefReadNode* op) { this->VisitExpr(op->ref); }
+void ExprVisitor::VisitExpr_(const RefReadNode* op) {
+  this->VisitSpan(op->span);
+  this->VisitExpr(op->ref);
+}
 
-void ExprVisitor::ExprVisitor::VisitExpr_(const RefWriteNode* op) {
+void ExprVisitor::VisitExpr_(const RefWriteNode* op) {
+  this->VisitSpan(op->span);
   this->VisitExpr(op->ref);
   this->VisitExpr(op->value);
 }
 
 void ExprVisitor::VisitExpr_(const ConstructorNode* op) {
+  // TODO(@jroesch): visit spans
   for (const Type& t : op->inputs) {
     this->VisitType(t);
   }
@@ -443,6 +472,7 @@ void ExprVisitor::VisitExpr_(const ConstructorNode* op) {
 }
 
 void ExprVisitor::VisitExpr_(const MatchNode* op) {
+  this->VisitSpan(op->span);
   this->VisitExpr(op->data);
   for (const Clause& c : op->clauses) {
     this->VisitClause(c);
@@ -450,6 +480,7 @@ void ExprVisitor::VisitExpr_(const MatchNode* op) {
 }
 
 void ExprVisitor::VisitClause(const Clause& op) {
+  // TODO(@jroesch): visit spans
   this->VisitPattern(op->lhs);
   this->VisitExpr(op->rhs);
 }
@@ -457,6 +488,8 @@ void ExprVisitor::VisitClause(const Clause& op) {
 void ExprVisitor::VisitPattern(const Pattern& p) { return; }
 
 void ExprVisitor::VisitType(const Type& t) { return; }
+
+void ExprVisitor::VisitSpan(const Span& span) { return; }
 
 // visitor to implement apply
 class ExprApplyVisit : public ExprVisitor {
@@ -539,7 +572,7 @@ Expr Bind(const Expr& expr, const tvm::Map<Var, Expr>& args_map) {
       return expr;
     }
     auto ret = Function(new_params, new_body, func->ret_type, func->type_params, func->attrs);
-    std::unordered_set<Var, ObjectHash, ObjectEqual> set;
+    std::unordered_set<Var, ObjectPtrHash, ObjectPtrEqual> set;
     for (const auto& v : FreeVars(expr)) {
       set.insert(v);
     }

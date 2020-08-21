@@ -42,11 +42,17 @@ namespace tvm {
 namespace codegen {
 
 runtime::Module Build(IRModule mod, const Target& target) {
-  if (BuildConfig::Current()->disable_assert) {
+  if (transform::PassContext::Current()
+          ->GetConfig<Bool>("tir.disable_assert", Bool(false))
+          .value()) {
     mod = tir::transform::SkipAssert()(mod);
   }
-
-  std::string build_f_name = "target.build." + target->target_name;
+  std::string build_f_name;
+  if (target->kind->name == "micro_dev") {
+    build_f_name = "target.build.c";
+  } else {
+    build_f_name = "target.build." + target->kind->name;
+  }
   // the build function.
   const PackedFunc* bf = runtime::Registry::Get(build_f_name);
   CHECK(bf != nullptr) << "target.build." << target << " is not enabled";

@@ -18,8 +18,6 @@
  */
 
 #include <gtest/gtest.h>
-#include <topi/broadcast.h>
-#include <topi/generic/injective.h>
 #include <tvm/driver/driver_api.h>
 #include <tvm/ir/module.h>
 #include <tvm/relay/analysis.h>
@@ -32,6 +30,8 @@
 #include <tvm/runtime/packed_func.h>
 #include <tvm/runtime/registry.h>
 #include <tvm/te/operation.h>
+#include <tvm/topi/broadcast.h>
+#include <tvm/topi/generic/injective.h>
 
 using namespace tvm;
 using namespace tvm::relay;
@@ -59,7 +59,7 @@ TVM_REGISTER_GLOBAL("test.strategy")
 TVM_REGISTER_GLOBAL("relay.backend.lower_call")
     .set_body_typed([](const relay::Call& call, const Array<te::Tensor>& inputs,
                        const Target& target) {
-      static auto fstrategy = Op::GetAttr<relay::FTVMStrategy>("FTVMStrategy");
+      static auto fstrategy = Op::GetAttrMap<relay::FTVMStrategy>("FTVMStrategy");
       Op op = Downcast<Op>(call->op);
       auto out_type = call->checked_type();
       OpStrategy strategy = fstrategy[op](call->attrs, inputs, out_type, target);
@@ -95,7 +95,7 @@ TEST(Relay, BuildModule) {
     pC[i] = i + 2;
   }
   // get schedule
-  auto reg = tvm::runtime::Registry::Get("relay.op._Register");
+  auto reg = tvm::runtime::Registry::Get("ir.RegisterOpAttr");
   if (!reg) {
     LOG(FATAL) << "no _Register";
   }

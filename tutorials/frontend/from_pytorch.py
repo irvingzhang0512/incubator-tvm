@@ -101,11 +101,8 @@ mod, params = relay.frontend.from_pytorch(scripted_model,
 target = 'llvm'
 target_host = 'llvm'
 ctx = tvm.cpu(0)
-with relay.build_config(opt_level=3):
-    graph, lib, params = relay.build(mod,
-                                     target=target,
-                                     target_host=target_host,
-                                     params=params)
+with tvm.transform.PassContext(opt_level=3):
+    lib = relay.build(mod, target=target, target_host=target_host, params=params)
 
 ######################################################################
 # Execute the portable graph on TVM
@@ -113,10 +110,9 @@ with relay.build_config(opt_level=3):
 # Now we can try deploying the compiled model on target.
 from tvm.contrib import graph_runtime
 dtype = 'float32'
-m = graph_runtime.create(graph, lib, ctx)
+m = graph_runtime.GraphModule(lib['default'](ctx))
 # Set inputs
 m.set_input(input_name, tvm.nd.array(img.astype(dtype)))
-m.set_input(**params)
 # Execute
 m.run()
 # Get outputs

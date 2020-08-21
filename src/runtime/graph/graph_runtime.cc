@@ -22,6 +22,7 @@
  */
 #include "graph_runtime.h"
 
+#include <tvm/runtime/container.h>
 #include <tvm/runtime/device_api.h>
 #include <tvm/runtime/ndarray.h>
 #include <tvm/runtime/packed_func.h>
@@ -134,6 +135,12 @@ void GraphRuntime::SetInputZeroCopy(int index, DLTensor* data_ref) {
  */
 int GraphRuntime::NumOutputs() const { return outputs_.size(); }
 /*!
+ * \brief Get the number of inputs
+ *
+ * \return The number of inputs to the graph.
+ */
+int GraphRuntime::NumInputs() const { return input_nodes_.size(); }
+/*!
  * \brief Return NDArray for given input index.
  * \param index The input index.
  *
@@ -197,7 +204,11 @@ void GraphRuntime::LoadParams(dmlc::Stream* strm) {
   CHECK(size == names.size()) << "Invalid parameters file format";
   for (size_t i = 0; i < size; ++i) {
     int in_idx = GetInputIndex(names[i]);
-    CHECK_GE(in_idx, 0) << "Found param for non-existent input: " << names[i];
+    if (in_idx < 0) {
+      NDArray temp;
+      temp.Load(strm);
+      continue;
+    }
     uint32_t eid = this->entry_id(input_nodes_[in_idx], 0);
     CHECK_LT(eid, data_entry_.size());
 
@@ -221,7 +232,7 @@ void GraphRuntime::ShareParams(const GraphRuntime& other, dmlc::Stream* strm) {
   CHECK(size == names.size()) << "Invalid parameters file format";
   for (size_t i = 0; i < size; ++i) {
     int in_idx = GetInputIndex(names[i]);
-    CHECK_GE(in_idx, 0) << "Found param for non-existent input: " << names[i];
+    if (in_idx < 0) continue;
     uint32_t eid = this->entry_id(input_nodes_[in_idx], 0);
     CHECK_LT(eid, data_entry_.size());
     CHECK_EQ(data_entry_[eid].use_count(), 1);
@@ -389,8 +400,8 @@ PackedFunc GraphRuntime::GetFunction(const std::string& name,
   // Return member functions during query.
   if (name == "set_input") {
     return PackedFunc([sptr_to_self, this](TVMArgs args, TVMRetValue* rv) {
-      if (args[0].type_code() == kTVMStr) {
-        int in_idx = this->GetInputIndex(args[0]);
+      if (String::CanConvertFrom(args[0])) {
+        int in_idx = this->GetInputIndex(args[0].operator String());
         if (in_idx >= 0) this->SetInput(in_idx, args[1]);
       } else {
         this->SetInput(args[0], args[1]);
@@ -398,8 +409,8 @@ PackedFunc GraphRuntime::GetFunction(const std::string& name,
     });
   } else if (name == "set_input_zero_copy") {
     return PackedFunc([sptr_to_self, this](TVMArgs args, TVMRetValue* rv) {
-      if (args[0].type_code() == kTVMStr) {
-        int in_idx = this->GetInputIndex(args[0]);
+      if (String::CanConvertFrom(args[0])) {
+        int in_idx = this->GetInputIndex(args[0].operator String());
         if (in_idx >= 0) this->SetInputZeroCopy(in_idx, args[1]);
       } else {
         this->SetInputZeroCopy(args[0], args[1]);
@@ -416,17 +427,21 @@ PackedFunc GraphRuntime::GetFunction(const std::string& name,
   } else if (name == "get_input") {
     return PackedFunc([sptr_to_self, this](TVMArgs args, TVMRetValue* rv) {
       int in_idx = 0;
-      if (args[0].type_code() == kTVMStr) {
-        in_idx = this->GetInputIndex(args[0]);
+      if (String::CanConvertFrom(args[0])) {
+        in_idx = this->GetInputIndex(args[0].operator String());
       } else {
         in_idx = args[0];
       }
-      CHECK_GE(in_idx, 0);
-      *rv = this->GetInput(in_idx);
+      if (in_idx >= 0) {
+        *rv = this->GetInput(in_idx);
+      }
     });
   } else if (name == "get_num_outputs") {
     return PackedFunc(
         [sptr_to_self, this](TVMArgs args, TVMRetValue* rv) { *rv = this->NumOutputs(); });
+  } else if (name == "get_num_inputs") {
+    return PackedFunc(
+        [sptr_to_self, this](TVMArgs args, TVMRetValue* rv) { *rv = this->NumInputs(); });
   } else if (name == "run") {
     return PackedFunc([sptr_to_self, this](TVMArgs args, TVMRetValue* rv) { this->Run(); });
   } else if (name == "load_params") {

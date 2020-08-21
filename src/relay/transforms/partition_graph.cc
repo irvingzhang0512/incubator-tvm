@@ -44,15 +44,11 @@
 
 #include "../analysis/annotated_region_set.h"
 #include "../backend/utils.h"
+#include "pass_util.h"
 
 namespace tvm {
 namespace relay {
 namespace partitioning {
-
-// Cache compiler_begin and compiler_end annotation ops for equivalence check to
-// reduce registry lookup overhead.
-static const Op& compiler_begin_op = Op::Get("annotation.compiler_begin");
-static const Op& compiler_end_op = Op::Get("annotation.compiler_end");
 
 /*! \brief This struct maintains the required metadata for a region to generate a corresponding
  * global function and function call. Global function will be passed to the target specific codegen
@@ -70,14 +66,14 @@ struct RegionFuncMetadata {
   /*! \brief Map from each region output expr (compiler end) node to
    * the corresponding function output expr.
    */
-  std::unordered_map<Expr, Expr, ObjectHash, ObjectEqual> region_func_out;
+  std::unordered_map<Expr, Expr, ObjectPtrHash, ObjectPtrEqual> region_func_out;
 
   /*! \brief Map from each region input expression (compiler begin) to
    * the corresponding function input variable. This cache is used to make sure
    * a region function will not have duplicated inputs even if it refers to
    * the same expr multiple times.
    */
-  std::unordered_map<Expr, Var, ObjectHash, ObjectEqual> region_func_in;
+  std::unordered_map<Expr, Var, ObjectPtrHash, ObjectPtrEqual> region_func_in;
 };
 
 /*! \brief This class partitions the expr labeled with begin and end annotations
@@ -123,8 +119,7 @@ class Partitioner : public MixedModeMutator {
       BaseFunc f_func = f.second;
 
       // Creating regionset per function in the module.
-      auto region_set = AnnotatedRegionSet::Create(f_func, partitioning::compiler_begin_op,
-                                                   partitioning::compiler_end_op);
+      auto region_set = AnnotatedRegionSet::Create(f_func, CompilerBeginOp(), CompilerEndOp());
       regions_sets_[region_set] = f_func;
     }
   }
@@ -133,7 +128,7 @@ class Partitioner : public MixedModeMutator {
     auto op_node = call->op.as<OpNode>();
     if (op_node == nullptr || call->attrs.as<CompilerAttrs>() == nullptr) {
       return post;
-    } else if (call->op == compiler_begin_op) {
+    } else if (call->op == CompilerBeginOp()) {
       // The annotation node is inserted on edge so it must have only one argument.
       CHECK_EQ(call->args.size(), 1U);
 
@@ -143,7 +138,7 @@ class Partitioner : public MixedModeMutator {
 
       // Backtrace the parent to find the first ancestor node that is not a begin or end op
       while (const auto* parent_call = parent.as<CallNode>()) {
-        if (parent_call->op == compiler_begin_op || parent_call->op == compiler_end_op) {
+        if (parent_call->op == CompilerBeginOp() || parent_call->op == CompilerEndOp()) {
           parent = parent_call->args[0];
         } else {
           break;
@@ -174,7 +169,7 @@ class Partitioner : public MixedModeMutator {
         return std::move(var);
       }
     } else {
-      CHECK_EQ(call->op, compiler_end_op);
+      CHECK_EQ(call->op, CompilerEndOp());
       // The annotation node is inserted on edge so it must have only one
       // argument.
       CHECK_EQ(call->args.size(), 1U);
@@ -266,37 +261,26 @@ class Partitioner : public MixedModeMutator {
   }
 
   /*!
-   * \brief Create a function and its function call for the given region. If the function has
-   * multiple outputs, a Tuple will be formed to aggregate all outputs, and TupleGetItem nodes
-   * will be created to serve output consumers.
+   * \brief Check if an expr is a constant or a tuple that only contain constants.
    */
-  void CreateFunction(AnnotatedRegion region, const CallNode* end_node) {
-    // Create fields which is a unique list of outputs.
-    Array<Expr> fields;
-    std::unordered_map<Expr, int, ObjectHash, ObjectEqual> out_expr_to_idx;
-    int out_idx = 0;
-    for (auto region_end_node : region->GetOutputs()) {
-      auto ret_node = Downcast<Call>(region_end_node)->args[0];
-      // Don't duplicate outputs.
-      if (!out_expr_to_idx.count(ret_node)) {
-        auto ret_expr = MixedModeMutator::VisitExpr(ret_node);
-        fields.push_back(ret_expr);
-        out_expr_to_idx[ret_node] = out_idx++;
-      }
-    }
+  bool IsConstant(const Expr& expr) const {
+    if (expr->IsInstance<ConstantNode>()) return true;
+    if (!expr->IsInstance<TupleNode>()) return false;
+    const auto* tn = expr.as<TupleNode>();
+    return std::all_of(tn->fields.begin(), tn->fields.end(),
+                       [](const Expr& e) { return e->IsInstance<ConstantNode>(); });
+  }
 
+  /*!
+   * \brief Create a call to the function that represents a region.
+   * \note The customized optimization pipeline will be invoked as well to
+   *       optimize each function that is handled by external codegen.
+   */
+  Call CreateRegionCall(AnnotatedRegion region, const Array<Expr>& fields,
+                        const CallNode* end_node) {
     Array<Var> params;
     Array<Expr> param_expr;
     Map<Var, Expr> params_bind;
-
-    auto IsConstant = [](const Expr& expr) {
-      if (expr->IsInstance<ConstantNode>()) return true;
-      if (!expr->IsInstance<TupleNode>()) return false;
-      const auto* tn = expr.as<TupleNode>();
-      return std::all_of(tn->fields.begin(), tn->fields.end(),
-                         [](const Expr& e) { return e->IsInstance<ConstantNode>(); });
-    };
-
     for (auto pair : region_func_meta_[region].args) {
       params.push_back(pair.first);
       if (IsConstant(pair.second)) {
@@ -319,17 +303,24 @@ class Partitioner : public MixedModeMutator {
     std::string target = end_node->attrs.as<CompilerAttrs>()->compiler;
     std::string name = target + "_" + std::to_string(region->GetID());
 
+    // Constant propagation
+    if (!params_bind.empty()) {
+      global_region_func = Downcast<Function>(relay::Bind(global_region_func, params_bind));
+    }
+    std::string ext_opt = "relay.ext." + target + ".optimize";
+    auto pf = tvm::runtime::Registry::Get(ext_opt);
+    if (pf != nullptr) {
+      auto mod = IRModule::FromExpr(global_region_func);
+      mod = (*pf)(mod);
+      global_region_func = Downcast<Function>(mod->Lookup("main"));
+    }
+
     global_region_func =
         WithAttr(std::move(global_region_func), tvm::attr::kGlobalSymbol, runtime::String(name));
     global_region_func = WithAttr(std::move(global_region_func), attr::kPrimitive, tvm::Integer(1));
     global_region_func =
         WithAttr(std::move(global_region_func), attr::kCompiler, tvm::runtime::String(target));
     global_region_func = WithAttr(std::move(global_region_func), attr::kInline, tvm::Integer(1));
-
-    // Constant propagation
-    if (!params_bind.empty()) {
-      global_region_func = Downcast<Function>(relay::Bind(global_region_func, params_bind));
-    }
 
     std::string fname = name;
     CHECK(!module_->ContainGlobalVar(fname)) << "Global function " << fname << " already exists";
@@ -344,6 +335,31 @@ class Partitioner : public MixedModeMutator {
     // Create a call node for the function.
     auto call = Call(glob_func, param_expr);
     region_func_meta_[region].func_call = call;
+
+    return call;
+  }
+
+  /*!
+   * \brief Create a function and its function call for the given region. If the function has
+   * multiple outputs, a Tuple will be formed to aggregate all outputs, and TupleGetItem nodes
+   * will be created to serve output consumers.
+   */
+  void CreateFunction(AnnotatedRegion region, const CallNode* end_node) {
+    // Create fields which is a unique list of outputs.
+    Array<Expr> fields;
+    std::unordered_map<Expr, int, ObjectPtrHash, ObjectPtrEqual> out_expr_to_idx;
+    int out_idx = 0;
+    for (auto region_end_node : region->GetOutputs()) {
+      auto ret_node = Downcast<Call>(region_end_node)->args[0];
+      // Don't duplicate outputs.
+      if (!out_expr_to_idx.count(ret_node)) {
+        auto ret_expr = MixedModeMutator::VisitExpr(ret_node);
+        fields.push_back(ret_expr);
+        out_expr_to_idx[ret_node] = out_idx++;
+      }
+    }
+
+    Call call = CreateRegionCall(region, fields, end_node);
 
     // Create output expr(s) for the function call.
     if (out_expr_to_idx.size() == 1) {
@@ -362,14 +378,14 @@ class Partitioner : public MixedModeMutator {
   }
 
   /*! \brief Map from each region to its metadata of the generated function. */
-  std::unordered_map<AnnotatedRegion, RegionFuncMetadata, ObjectHash, ObjectEqual>
+  std::unordered_map<AnnotatedRegion, RegionFuncMetadata, ObjectPtrHash, ObjectPtrEqual>
       region_func_meta_;
 
   /*! \brief Each region set is associated with a function in the module.
    * This map maintains the mapping between regionsets and the function it
    * belongs to
    */
-  std::unordered_map<AnnotatedRegionSet, BaseFunc, ObjectHash, ObjectEqual> regions_sets_;
+  std::unordered_map<AnnotatedRegionSet, BaseFunc, ObjectPtrHash, ObjectPtrEqual> regions_sets_;
 
   /*!\brief The IRModule used for partitioning. */
   IRModule module_;
@@ -404,21 +420,90 @@ IRModule RemoveDefaultAnnotations(IRModule module) {
   return module;
 }
 
+/*! \brief There can be regions with multiple outputs where each output
+ *  could be a tuple output. Such tuple outputs needs to be flattened
+ *  otherwise the function would create tuples of tuples. Moreover, tuple
+ *  of tuples are valid relay, however they are not currently supported by
+ *  graph runtime or relay VM.
+ */
+
+// New annotations would be required to be added for each flattened output
+const PackedFunc* make_end_op = runtime::Registry::Get("relay.op.annotation._make.compiler_end");
+
+IRModule FlattenTupleOutputs(IRModule module) {
+  class TupleOutFlattener : public ExprRewriter {
+   public:
+    TupleOutFlattener() = default;
+
+    Expr Rewrite_(const CallNode* call, const Expr& post) final {
+      if (call->op == CompilerEndOp()) {
+        std::string target = call->attrs.as<CompilerAttrs>()->compiler;
+        // Arguments of annotation ops should be 1
+        CHECK_EQ(call->args.size(), 1U);
+        auto annotated_op = Downcast<Call>(post)->args[0];
+        if (const auto* tn = annotated_op.as<TupleNode>()) {
+          Array<Expr> new_fields;
+
+          // Here each input of the tuple will be annotated with compiler_ends
+          for (auto& tn_arg : tn->fields) {
+            new_fields.push_back((*make_end_op)(tn_arg, target));
+          }
+
+          // Return a tuple of compiler_ends in the place of the tuple that was
+          // annotated with a compiler_end.
+          auto out = Tuple(new_fields);
+          return std::move(out);
+        }
+      }
+      return post;
+    }
+  };
+
+  auto glob_funcs = module->functions;
+  // module is mutable, hence, we make a copy of it.
+  module.CopyOnWrite();
+  for (const auto& pair : glob_funcs) {
+    if (auto* fn = pair.second.as<FunctionNode>()) {
+      auto func = GetRef<Function>(fn);
+      TupleOutFlattener to_flattener;
+      auto removed = PostOrderRewrite(func->body, &to_flattener);
+      func = Function(func->params, removed, func->ret_type, func->type_params, func->attrs);
+      module->Update(pair.first, func);
+    }
+  }
+  return module;
+}
+
 }  // namespace partitioning
 
 namespace transform {
 
 Pass PartitionGraph() {
-  runtime::TypedPackedFunc<IRModule(IRModule, PassContext)> part_func = [=](IRModule m,
-                                                                            PassContext pc) {
+  runtime::TypedPackedFunc<IRModule(IRModule, PassContext)> flatten_tuples = [=](IRModule m,
+                                                                                 PassContext pc) {
+    // There could be compiler_end annotations on tuples
+    // If the corresponding region is having multiple compiler_ends,
+    // this would lead to creation of tuples of tuples.
+    // Thus, we flatten the tuples by transfering the compiler_end to
+    // the tuple inputs.
+    return partitioning::FlattenTupleOutputs(m);
+  };
+
+  runtime::TypedPackedFunc<IRModule(IRModule, PassContext)> remove_defaults = [=](IRModule m,
+                                                                                  PassContext pc) {
     // TODO(@comaniac, @zhiics): We should also handle the annotation with "default" attribute
     // by treating them as un-annotated, but we don't have it yet. This workaround pass removes
     // all "default" annotations and should be deleted in the future.
-    auto new_m = partitioning::RemoveDefaultAnnotations(m);
-    return partitioning::Partitioner(new_m).Partition();
+    return partitioning::RemoveDefaultAnnotations(m);
   };
-  auto partitioned = CreateModulePass(part_func, 0, "PartitionGraph", {});
-  return Sequential({partitioned, InferType()});
+
+  runtime::TypedPackedFunc<IRModule(IRModule, PassContext)> part_func =
+      [=](IRModule m, PassContext pc) { return partitioning::Partitioner(m).Partition(); };
+
+  auto flatten_tuples_pass = CreateModulePass(flatten_tuples, 0, "FlattenNestedTuples", {});
+  auto remove_default_pass = CreateModulePass(remove_defaults, 0, "RemoveDefaultAnnotations", {});
+  auto partition_pass = CreateModulePass(part_func, 0, "PartitionGraph", {});
+  return Sequential({flatten_tuples_pass, remove_default_pass, partition_pass, InferType()});
 }
 
 TVM_REGISTER_GLOBAL("relay._transform.PartitionGraph").set_body_typed(transform::PartitionGraph);

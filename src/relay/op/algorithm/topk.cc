@@ -23,6 +23,7 @@
  */
 #include <tvm/relay/attrs/algorithm.h>
 #include <tvm/relay/op.h>
+#include <tvm/tir/op.h>
 
 namespace tvm {
 namespace relay {
@@ -44,10 +45,15 @@ bool TopKRel(const Array<Type>& types, int num_inputs, const Attrs& attrs,
   CHECK(axis >= 0 && axis < ndim);
   Array<IndexExpr> out_shape;
   for (int i = 0; i < ndim; ++i) {
-    if (i != axis || param->k < 1) {
+    if (i != axis) {
       out_shape.push_back(data->shape[i]);
     } else {
-      out_shape.push_back(param->k);
+      const Integer& ck = param->k.value();
+      if (ck->value < 1) {
+        out_shape.push_back(data->shape[i]);
+      } else {
+        out_shape.push_back(ck);
+      }
     }
   }
   auto values_ty = TensorType(out_shape, data->dtype);
@@ -64,9 +70,9 @@ bool TopKRel(const Array<Type>& types, int num_inputs, const Attrs& attrs,
   return true;
 }
 
-Expr MakeTopK(Expr data, int k, int axis, std::string ret_type, bool is_ascend, DataType dtype) {
+Expr MakeTopK(Expr data, int k, int axis, String ret_type, bool is_ascend, DataType dtype) {
   auto attrs = make_object<TopKAttrs>();
-  attrs->k = k;
+  attrs->k = Integer(k);
   attrs->axis = axis;
   attrs->ret_type = ret_type;
   attrs->is_ascend = is_ascend;

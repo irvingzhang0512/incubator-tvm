@@ -221,7 +221,7 @@ class Var(ExprWithOp):
     @property
     def name_hint(self):
         """Get name hint of the current var."""
-        name = self.vid.name_hint
+        name = str(self.vid.name_hint)
         return name
 
 
@@ -234,7 +234,7 @@ class Call(ExprWithOp):
 
     Parameters
     ----------
-    op: tvm.relay.Op or any tvm.relay.Expr with function type.
+    op: tvm.ir.Op or any tvm.relay.Expr with function type.
         The operation to be called.
 
     args: List[tvm.relay.Expr]
@@ -518,7 +518,7 @@ def bind(expr, binds):
     expr : tvm.relay.Expr
         The input expression.
 
-    binds : Union[Map[tvm.relay.Var, tvm.relay.Expr], Map[str, tvm.relay.Expr]]
+    binds : Map[tvm.relay.Var, tvm.relay.Expr]
         The specific bindings.
 
     Returns

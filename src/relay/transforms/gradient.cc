@@ -68,7 +68,7 @@ Type WithGradientType(const Type&);
 /*! return an expression that represent differentiation of e (according to WithGradientType).
  *  This version only work on first order code without control flow.
  */
-Expr FirstOrderGradient(const Expr& e, const IRModule& mod);
+Expr FirstOrderGradient(const Expr& e, const Optional<IRModule>& mod);
 
 Type WithGradientType(const Type& t) {
   // TODO(M.K.): stricter checking
@@ -78,9 +78,11 @@ Type WithGradientType(const Type& t) {
 }
 
 //! \brief if the expression is a GlobalVar, transform to it's expression.
-Expr DeGlobal(const IRModule& mod, const Expr& e) {
-  if (const auto* x = e.as<GlobalVarNode>()) {
-    BaseFunc base_func = mod->Lookup(GetRef<GlobalVar>(x));
+Expr DeGlobal(const Optional<IRModule>& mod, const Expr& e) {
+  const auto* x = e.as<GlobalVarNode>();
+
+  if (mod.defined() && (x)) {
+    BaseFunc base_func = mod.value()->Lookup(GetRef<GlobalVar>(x));
     if (auto* n = base_func.as<FunctionNode>()) {
       return n->body;
     } else {
@@ -104,6 +106,34 @@ struct ADValueNode {
   }
 };
 
+template <typename F>
+Expr MultiFactory(const Type& t, F factory) {
+  if (auto* tt = t.as<TensorTypeNode>()) {
+    return factory(tt->shape, tt->dtype);
+  } else if (auto* tt = t.as<TupleTypeNode>()) {
+    std::vector<Expr> res;
+    for (size_t i = 0; i < tt->fields.size(); i++) {
+      res.push_back(MultiFactory(tt->fields[i], factory));
+    }
+    return Tuple(res);
+  } else {
+    LOG(FATAL) << "unsupported type to create tensors of: " << tt;
+    throw;
+  }
+}
+
+template <typename F, typename F2>
+Expr MultiFactoryLike(const Expr& e, const Type& t, F factory, F2 factory_like) {
+  if (t.as<TensorTypeNode>()) {
+    return factory_like(e);
+  } else if (auto* tt = t.as<TupleTypeNode>()) {
+    return MultiFactory(t, factory);
+  } else {
+    LOG(FATAL) << "unsupported type to tensors of: " << tt;
+    throw;
+  }
+}
+
 using ADValue = std::shared_ptr<ADValueNode>;
 
 /*! \brief AD over a program which generates a tensor output. */
@@ -111,7 +141,9 @@ struct ADTensor : ADValueNode {
   Expr forward;
   mutable Expr reverse;  // must be a variable to avoid duplication
   ADTensor(LetList* ll, const Expr& forward)
-      : forward(ll->Push(forward)), reverse(ll->Push(ZerosLike(this->forward))) {
+      : forward(ll->Push(forward)),
+        reverse(
+            ll->Push(MultiFactoryLike(this->forward, forward->checked_type(), Zeros, ZerosLike))) {
     this->forward->checked_type_ = forward->checked_type();
   }
 };
@@ -130,13 +162,23 @@ struct ADFunction : ADValueNode {
 };
 
 struct FirstOrderReverseAD : ExprFunctor<ADValue(const Expr&)> {
-  const OpMap<FPrimalGradient> rev_map = Op::GetAttr<FPrimalGradient>("FPrimalGradient");
+  using TBase = ExprFunctor<ADValue(const Expr&)>;
+  const OpAttrMap<FPrimalGradient> rev_map = Op::GetAttrMap<FPrimalGradient>("FPrimalGradient");
   std::vector<std::function<void(LetList* ll)>> backprop_actions;
   // we assume no closure so no need for lexical scoping
-  std::unordered_map<Var, ADValue, ObjectHash, ObjectEqual> env;
+  std::unordered_map<Expr, ADValue, ObjectPtrHash, ObjectPtrEqual> env;
   LetList* ll;
 
   FirstOrderReverseAD(LetList* ll) : ll(ll) {}
+
+  ADValue VisitExpr(const Expr& n) final {
+    if (env.count(n)) {
+      return env.at(n);
+    }
+    auto ret = TBase::VisitExpr(n);
+    env[n] = ret;
+    return ret;
+  }
 
   ADValue VisitExpr_(const OpNode* op) final {
     Op op_ref = GetRef<Op>(op);
@@ -161,6 +203,51 @@ struct FirstOrderReverseAD : ExprFunctor<ADValue(const Expr&)> {
           });
           return ret;
         });
+  }
+
+  ADValue VisitExpr_(const TupleGetItemNode* op) final {
+    Expr e = GetRef<Expr>(op);
+    ADValue tup = VisitExpr(op->tuple);
+    auto tt = op->tuple->checked_type().as<TupleTypeNode>();
+    size_t size = tt->fields.size();
+    size_t idx = op->index;
+    auto ret = std::make_shared<ADTensor>(ll, e);
+    backprop_actions.push_back([tup, idx, size, ret](LetList* ll) {
+      auto rev = tup->get<ADTensor>().reverse;
+      // special-case Tuple, to avoid long chains of GetItem/Tuple,
+      // but we might have functions using tuples, so we don't know
+      // that the reverse node is always a tuple
+      std::vector<Expr> grfields;
+      if (auto tup_node = rev.as<TupleNode>()) {
+        for (size_t i = 0; i < size; ++i) {
+          grfields.push_back(i != idx ? tup_node->fields[i]
+                                      : Add(tup_node->fields[i], ret->reverse));
+        }
+      } else {
+        for (size_t i = 0; i < size; ++i) {
+          grfields.push_back(i != idx ? TupleGetItem(rev, i)
+                                      : Add(TupleGetItem(rev, i), ret->reverse));
+        }
+      }
+      tup->get<ADTensor>().reverse = ll->Push(Tuple(grfields));
+    });
+    return ret;
+  }
+
+  ADValue VisitExpr_(const TupleNode* op) final {
+    Expr e = GetRef<Expr>(op);
+    std::vector<ADValue> fields;
+    for (const auto& f : op->fields) {
+      fields.push_back(VisitExpr(f));
+    }
+    auto ret = std::make_shared<ADTensor>(ll, e);
+    backprop_actions.push_back([fields, ret](LetList* ll) {
+      for (size_t i = 0; i < fields.size(); ++i) {
+        fields[i]->get<ADTensor>().reverse =
+            ll->Push(Add(fields[i]->get<ADTensor>().reverse, TupleGetItem(ret->reverse, i)));
+      }
+    });
+    return ret;
   }
 
   ADValue VisitExpr_(const ConstantNode* op) final {
@@ -191,10 +278,8 @@ struct FirstOrderReverseAD : ExprFunctor<ADValue(const Expr&)> {
         });
   }
 
-  ADValue VisitExpr_(const VarNode* op) final {
-    Var v = GetRef<Var>(op);
-    return env.at(v);
-  }
+  // Var will always be in env, handled in VisitExpr (without _), so we don't need
+  // to implement its VisitExpr_.
 };
 
 Type GradRetType(const Function& f) {
@@ -214,7 +299,7 @@ Type GradRetType(const Function& f) {
   return TupleType({f->ret_type, TupleType(vt)});
 }
 
-Expr FirstOrderGradient(const Expr& re, const IRModule& mod) {
+Expr FirstOrderGradient(const Expr& re, const Optional<IRModule>& mod) {
   // Currently we first remove any global functions for the first
   // order case.
   auto e = DeGlobal(mod, re);
@@ -233,7 +318,7 @@ Expr FirstOrderGradient(const Expr& re, const IRModule& mod) {
     auto c = rev->get<ADFunction>().func(f->checked_type(), args, Attrs(), {});
     const auto& res = c->get<ADTensor>();
     Expr grad = LetList::With([&](LetList* ll) {
-      res.reverse = OnesLike(res.forward);
+      res.reverse = MultiFactoryLike(res.forward, res.forward->checked_type(), Ones, OnesLike);
       for (auto it = reverse_ad.backprop_actions.rbegin(); it != reverse_ad.backprop_actions.rend();
            ++it) {
         (*it)(ll);
@@ -350,11 +435,11 @@ Expr BPEmpty() {
 }
 
 struct ReverseAD : ExprMutator {
-  using ADVarMap = std::unordered_map<Var, Var, ObjectHash, ObjectEqual>;
+  using ADVarMap = std::unordered_map<Var, Var, ObjectPtrHash, ObjectPtrEqual>;
 
   Var bp;
   std::shared_ptr<ADVarMap> ad_vars;
-  const OpMap<FPrimalGradient> rev_map = Op::GetAttr<FPrimalGradient>("FPrimalGradient");
+  const OpAttrMap<FPrimalGradient> rev_map = Op::GetAttrMap<FPrimalGradient>("FPrimalGradient");
 
   explicit ReverseAD(const Var& bp, std::shared_ptr<ADVarMap> ad_vars) : bp(bp), ad_vars(ad_vars) {}
 
@@ -456,7 +541,7 @@ struct ReverseAD : ExprMutator {
 
 bool MissingGrad(const Expr& e) {
   struct MGVisitor : ExprVisitor {
-    const OpMap<FPrimalGradient> rev_map = Op::GetAttr<FPrimalGradient>("FPrimalGradient");
+    const OpAttrMap<FPrimalGradient> rev_map = Op::GetAttrMap<FPrimalGradient>("FPrimalGradient");
     std::unordered_set<std::string> op_names;
 
     void VisitExpr_(const OpNode* op) final {
@@ -482,7 +567,7 @@ bool MissingGrad(const Expr& e) {
   return false;
 }
 
-Expr Gradient(const Expr& re, const IRModule& mod) {
+Expr Gradient(const Expr& re, const Optional<IRModule>& mod) {
   auto e = DeGlobal(mod, re);
   auto f = e.as<FunctionNode>();
   CHECK(f) << "input need to be a function";

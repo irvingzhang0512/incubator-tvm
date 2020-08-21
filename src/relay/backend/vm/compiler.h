@@ -29,7 +29,7 @@
 #include <tvm/relay/expr_functor.h>
 #include <tvm/relay/interpreter.h>
 #include <tvm/relay/transform.h>
-#include <tvm/runtime/vm.h>
+#include <tvm/runtime/vm/vm.h>
 #include <tvm/support/logging.h>
 #include <tvm/tir/function.h>
 
@@ -55,7 +55,7 @@ using namespace tvm::runtime::vm;
 using namespace relay::transform;
 
 template <typename T, typename U>
-using NodeMap = std::unordered_map<T, U, ObjectHash, ObjectEqual>;
+using NodeMap = std::unordered_map<T, U, ObjectPtrHash, ObjectPtrEqual>;
 using TagMap = NodeMap<tvm::relay::Constructor, Index>;
 using TagNameMap = std::unordered_map<size_t, tvm::relay::Constructor>;
 using GlobalMap = NodeMap<GlobalVar, Index>;
@@ -79,7 +79,7 @@ struct VMCompilerContext {
   // List of cached functions
   std::vector<CachedFunc> cached_funcs;
   // The functions that have been lowered.
-  std::unordered_map<tir::PrimFunc, size_t, ObjectHash, ObjectEqual> seen_funcs;
+  std::unordered_map<tir::PrimFunc, size_t, ObjectPtrHash, ObjectPtrEqual> seen_funcs;
 };
 
 class VMCompiler : public runtime::ModuleNode {

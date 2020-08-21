@@ -44,7 +44,9 @@ enum DeviceAttrKind : int {
   kMaxClockRate = 6,
   kMultiProcessorCount = 7,
   kMaxThreadDimensions = 8,
-  kGcnArch = 9
+  kMaxRegistersPerBlock = 9,
+  kGcnArch = 10,
+  kApiVersion = 11
 };
 
 /*! \brief Number of bytes each allocation must align to */
@@ -177,7 +179,7 @@ class TVM_DLL DeviceAPI {
   virtual void FreeWorkspace(TVMContext ctx, void* ptr);
 
   /*!
-   * \brief Get device API base don context.
+   * \brief Get device API based on context.
    * \param ctx The context
    * \param allow_missing Whether allow missing
    * \return The corresponding device API.

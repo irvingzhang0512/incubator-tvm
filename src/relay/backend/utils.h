@@ -44,6 +44,26 @@ namespace relay {
 namespace backend {
 
 /*!
+ * \brief A helper to expand the params by adding the ones used in a given expression.
+ */
+struct ConstantUpdater : public ExprVisitor {
+ public:
+  ConstantUpdater(const std::string& symbol,
+                  std::unordered_map<std::string, runtime::NDArray>* params)
+      : symbol_(symbol), params_(params) {}
+
+  void VisitExpr_(const ConstantNode* cn) final {
+    std::string name = symbol_ + "_const_" + std::to_string(const_idx_++);
+    (*params_)[name] = cn->data;
+  }
+
+ private:
+  int const_idx_{0};
+  std::string symbol_;
+  std::unordered_map<std::string, runtime::NDArray>* params_;
+};
+
+/*!
  * \brief A simple wrapper around ExprFunctor for a single argument case.
  *  The result of visit is memoized.
  */
@@ -73,7 +93,7 @@ class MemoizedExprTranslator : public ::tvm::relay::ExprFunctor<OutputType(const
 
  protected:
   /*! \brief Internal map used for memoization. */
-  std::unordered_map<Expr, OutputType, ObjectHash, ObjectEqual> memo_;
+  std::unordered_map<Expr, OutputType, ObjectPtrHash, ObjectPtrEqual> memo_;
 };
 
 /*!
@@ -98,6 +118,23 @@ inline const runtime::TypedPackedFunc<R(Args...)> GetTypedPackedFunc(const std::
   CHECK(pf != nullptr) << "can not find packed function";
   return runtime::TypedPackedFunc<R(Args...)>(*pf);
 }
+
+/*!
+ * \brief Extract shape from an IndexExpr array to std::vector<int64_t>
+ *
+ * \param shape The shape in Array
+ * \return The converted shape in std::vector<int64_t>
+ */
+inline std::vector<int64_t> GetIntShape(const Array<IndexExpr>& shape) {
+  std::vector<int64_t> ret;
+  for (const auto& dim : shape) {
+    const int64_t* pval = tir::as_const_int(dim);
+    CHECK(pval) << "Expect integer, but received: " << dim->GetTypeKey();
+    ret.push_back(*pval);
+  }
+  return ret;
+}
+
 /*!
  * \brief Convert type to string
  *
@@ -128,7 +165,7 @@ inline std::string DType2String(const tvm::DataType dtype) {
 inline relay::Function BindParamsByName(
     relay::Function func, const std::unordered_map<std::string, runtime::NDArray>& params) {
   std::unordered_map<std::string, relay::Var> name_dict;
-  std::unordered_set<relay::Var, ObjectHash, ObjectEqual> repeat_var;
+  std::unordered_set<relay::Var, ObjectPtrHash, ObjectPtrEqual> repeat_var;
   for (auto arg : func->params) {
     const auto& name = arg->name_hint();
     if (name_dict.count(name)) {
@@ -138,7 +175,7 @@ inline relay::Function BindParamsByName(
     }
   }
 
-  std::unordered_map<relay::Var, Expr, ObjectHash, ObjectEqual> bind_dict;
+  std::unordered_map<relay::Var, Expr, ObjectPtrHash, ObjectPtrEqual> bind_dict;
   for (auto& kv : params) {
     if (name_dict.count(kv.first) == 0) {
       continue;
@@ -209,6 +246,18 @@ inline const CallNode* GetRootCall(const CallNode* current_call, int depth,
 
   const auto* next_call = current_call->args[0].as<CallNode>();
   return GetRootCall(next_call, depth - 1, expected_op_names);
+}
+
+/*!
+ * \brief Get the external symbol of the Relay function name.
+ *
+ * \param func The provided function.
+ * \return An external symbol.
+ */
+inline std::string GetExtSymbol(const Function& func) {
+  const auto name_node = func->GetAttr<String>(tvm::attr::kGlobalSymbol);
+  CHECK(name_node.defined()) << "Fail to retrieve external symbol.";
+  return std::string(name_node.value());
 }
 
 }  // namespace backend

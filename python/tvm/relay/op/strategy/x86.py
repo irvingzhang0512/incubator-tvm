@@ -19,7 +19,7 @@
 import logging
 
 import re
-import topi
+from tvm import topi
 from tvm.te import SpecializedCondition
 from .generic import *
 from .. import op as _op
@@ -202,6 +202,24 @@ def conv2d_transpose_strategy_cpu(attrs, inputs, out_type, target):
         name="conv2d_transpose_nchw.x86")
     return strategy
 
+
+@conv3d_transpose_strategy.register("cpu")
+def conv3d_transpose_strategy_cpu(attrs, inputs, out_type, target):
+    """conv3d_transpose x86 strategy"""
+    layout = attrs.data_layout
+    dilation = get_const_tuple(attrs.dilation)
+    groups = attrs.groups
+    assert layout == "NCDHW", "only support ncdhw for now"
+    assert dilation == (1, 1, 1), "not support dilate now"
+    assert groups == 1, "only support groups == 1 for now"
+    strategy = _op.OpStrategy()
+    strategy.add_implementation(
+        wrap_compute_conv3d_transpose(topi.x86.conv3d_transpose_ncdhw),
+        wrap_topi_schedule(topi.x86.schedule_conv3d_transpose_ncdhw),
+        name="conv3d_transpose_ncdhw.x86")
+    return strategy
+
+
 @conv3d_strategy.register("cpu")
 def conv3d_strategy_cpu(attrs, inputs, out_type, target):
     """conv3d generic strategy"""
@@ -244,15 +262,37 @@ def dense_strategy_cpu(attrs, inputs, out_type, target):
     """dense x86 strategy"""
     strategy = _op.OpStrategy()
     m, _ = inputs[0].shape
+    same_type = inputs[0].dtype == inputs[1].dtype == out_type.dtype
+    dtype = inputs[0].dtype
+    u8s8s32 = dtype == "uint8" and inputs[1].dtype == "int8" and out_type.dtype == "int32"
     strategy.add_implementation(wrap_compute_dense(topi.x86.dense_nopack),
                                 wrap_topi_schedule(topi.x86.schedule_dense_nopack),
                                 name="dense_nopack.x86",
                                 plevel=10)
     if "cblas" in target.libs:
-        strategy.add_implementation(wrap_compute_dense(topi.x86.dense_cblas),
-                                    wrap_topi_schedule(topi.x86.schedule_dense_cblas),
-                                    name="dense_cblas.x86",
-                                    plevel=15)
+        with SpecializedCondition(same_type and dtype in ["float32", "float64"]):
+            strategy.add_implementation(
+                wrap_compute_dense(topi.x86.dense_cblas),
+                wrap_topi_schedule(topi.x86.schedule_dense_cblas),
+                name="dense_cblas.x86",
+                plevel=13,
+            )
+    if "mkl" in target.libs:
+        with SpecializedCondition(same_type and dtype in ["float32", "float64"] or u8s8s32):
+            strategy.add_implementation(
+                wrap_compute_dense(topi.x86.dense_mkl),
+                wrap_topi_schedule(topi.x86.schedule_dense_mkl),
+                name="dense_mkl.x86",
+                plevel=14,
+            )
+    if "mkldnn" in target.libs:
+        with SpecializedCondition(same_type and dtype == "float32"):
+            strategy.add_implementation(
+                wrap_compute_dense(topi.x86.dense_mkldnn),
+                wrap_topi_schedule(topi.x86.schedule_dense_mkldnn),
+                name="dense_mkldnn.x86",
+                plevel=15,
+            )
     with SpecializedCondition(m >= 16):
         # this implementation may not be well-optimized, so use plevel=8 for now.
         strategy.add_implementation(wrap_compute_dense(topi.x86.dense_pack),
@@ -276,11 +316,16 @@ def batch_matmul_strategy_cpu(attrs, inputs, out_type, target):
                                     plevel=15)
     return strategy
 
-@schedule_sparse_dense.register("cpu")
-def schedule_sparse_dense_cpu(attrs, outs, target):
-    """schedule sparse_dense for x86"""
-    with target:
-        return topi.x86.schedule_sparse_dense(outs)
+@sparse_dense_strategy.register("cpu")
+def sparse_dense_strategy_cpu(attrs, inputs, out_type, target):
+    """sparse dense x86 strategy"""
+    strategy = _op.OpStrategy()
+    strategy.add_implementation(wrap_compute_sparse_dense(topi.nn.sparse_dense),
+                                wrap_topi_schedule(topi.x86.schedule_sparse_dense),
+                                name="sparse_dense.x86",
+                                plevel=10)
+    return strategy
+
 
 @roi_align_strategy.register("cpu")
 def roi_align_strategy_cpu(attrs, inputs, out_type, target):

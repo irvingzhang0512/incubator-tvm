@@ -36,7 +36,7 @@ def benchmark_execution(mod,
                         model="unknown"):
     def get_graph_runtime_output(mod, data, params, target, ctx,
                                  dtype='float32', number=2, repeat=20):
-        with relay.build_config(opt_level=3):
+        with tvm.transform.PassContext(opt_level=3):
             graph, lib, params = relay.build(mod, target, params=params)
 
         m = graph_runtime.create(graph, lib, ctx)
@@ -59,10 +59,9 @@ def benchmark_execution(mod,
 
     def get_vm_output(mod, data, params, target, ctx, dtype='float32',
                       number=2, repeat=20):
-        with relay.build_config(opt_level=3):
+        with tvm.transform.PassContext(opt_level=3):
             exe = vm.compile(mod, target, params=params)
-            rly_vm = vm_rt.VirtualMachine(exe)
-            rly_vm.init(ctx)
+            rly_vm = vm_rt.VirtualMachine(exe, ctx)
             result = rly_vm.run(data)
 
         if measure:

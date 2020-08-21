@@ -164,6 +164,7 @@ class ExprVisitor : public ::tvm::relay::ExprFunctor<void(const Expr& n)> {
   virtual void VisitType(const Type& t);
   virtual void VisitClause(const Clause& c);
   virtual void VisitPattern(const Pattern& c);
+  virtual void VisitSpan(const Span& span);
 
  protected:
   // Internal visiting counter
@@ -214,7 +215,7 @@ class ExprMutator : public ::tvm::relay::ExprFunctor<Expr(const Expr&)> {
 
  protected:
   /*! \brief Internal map used for memoization. */
-  std::unordered_map<Expr, Expr, ObjectHash, ObjectEqual> memo_;
+  std::unordered_map<Expr, Expr, ObjectPtrHash, ObjectPtrEqual> memo_;
 };
 
 /*!

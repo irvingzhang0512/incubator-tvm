@@ -28,7 +28,6 @@
 #include <tvm/relay/expr.h>
 #include <tvm/relay/expr_functor.h>
 #include <tvm/relay/transform.h>
-#include <tvm/runtime/vm.h>
 #include <tvm/support/logging.h>
 
 #include <iostream>
@@ -196,7 +195,7 @@ class LambdaLifter : public ExprMutator {
   }
 
  private:
-  std::unordered_map<Var, Expr, ObjectHash, ObjectEqual> lambda_map_;
+  std::unordered_map<Var, Expr, ObjectPtrHash, ObjectPtrEqual> lambda_map_;
   std::vector<Var> letrec_;
   IRModule module_;
 };

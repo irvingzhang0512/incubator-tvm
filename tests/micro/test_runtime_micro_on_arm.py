@@ -23,17 +23,16 @@ from tvm.contrib import graph_runtime, util
 from tvm import relay
 import tvm.micro as micro
 from tvm.micro import create_micro_mod
-from tvm.relay.testing import resnet
 
 # Use real micro device - an STM32F746 discovery board
-# SETUP: 
+# SETUP:
 # Be sure to have openocd installed and running
 # Ex : openocd -f board/stm32f7discovery.cfg
 # Be sure to have the ST CMSIS library downloaded, installed and
 # Ex : export CMSIS_ST_PATH="/home/yourid/st/STM32Cube_FW_F7_V1.16.0/Drivers/CMSIS"
 DEV_CONFIG_A = micro.device.arm.stm32f746xx.generate_config("127.0.0.1", 6666)
 DEV_CONFIG_B = micro.device.arm.stm32f746xx.generate_config("127.0.0.1", 6666)
-TARGET = 'c -device=micro_dev'
+TARGET = 'micro_dev'
 
 def relay_micro_build(func, dev_config, params=None):
     """Create a graph runtime module with a micro device context from a Relay function.
@@ -54,9 +53,9 @@ def relay_micro_build(func, dev_config, params=None):
     mod : tvm.runtime.Module
         graph runtime module for the target device
     """
-    disable_vectorize = tvm.target.build_config(disable_vectorize=True)
-    disable_fusion = relay.build_config(disabled_pass={'FuseOps'})
-    with disable_vectorize, disable_fusion:
+    with tvm.transform.PassContext(disabled_pass={'FuseOps'}, config={
+        "tir.disable_vectorize": True
+    }):
         graph, c_mod, params = relay.build(func, target=TARGET, params=params)
     micro_mod = micro.create_micro_mod(c_mod, dev_config)
     ctx = tvm.micro_dev(0)
@@ -76,7 +75,7 @@ break UTVMDone
 def reset_gdbinit():
     if 'server_port' not in DEV_CONFIG_A:
         return
-    try: 
+    try:
         gdb_init_dir = os.environ['MICRO_GDB_INIT_DIR']
     except KeyError:
         return
@@ -230,7 +229,9 @@ def test_conv2d():
     w_shape = list(map(lambda x: x.value, mod['main'].params[1].checked_type.shape))
     out_shape = list(map(lambda x: x.value, mod['main'].ret_type.shape))
 
-    with tvm.target.build_config(disable_vectorize=True):
+    with tvm.transform.PassContext(config={
+        "tir.disable_vectorize": True
+    }):
         graph, c_mod, params = relay.build(mod, target="c")
 
     with micro.Session(DEV_CONFIG_A):

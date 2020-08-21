@@ -15,6 +15,7 @@
 # specific language governing permissions and limitations
 # under the License.
 """Unit tests for graph partitioning."""
+# pylint: disable=not-callable
 import os
 import sys
 
@@ -194,19 +195,21 @@ def check_result(mod, map_inputs, out_shape, result, tol=1e-5, target="llvm",
 
     def check_vm_result():
         compile_engine.get().clear()
-        with relay.build_config(opt_level=3):
+        with tvm.transform.PassContext(opt_level=3):
             exe = relay.vm.compile(mod, target=target, params=params)
         code, lib = exe.save()
         lib = update_lib(lib)
         exe = runtime.vm.Executable.load_exec(code, lib)
-        vm = runtime.vm.VirtualMachine(exe)
-        vm.init(ctx)
-        out = vm.run(**map_inputs)
-        tvm.testing.assert_allclose(out.asnumpy(), result, rtol=tol, atol=tol)
+        vm = runtime.vm.VirtualMachine(exe, ctx)
+        outs = vm.run(**map_inputs)
+        outs = outs if isinstance(outs, runtime.container.ADT) else [outs]
+        results = result if isinstance(result, list) else [result]
+        for out, ref in zip(outs, results):
+            tvm.testing.assert_allclose(out.asnumpy(), ref, rtol=tol, atol=tol)
 
     def check_graph_runtime_result():
         compile_engine.get().clear()
-        with relay.build_config(opt_level=3):
+        with tvm.transform.PassContext(opt_level=3):
             json, lib, param = relay.build(mod, target=target, params=params)
         lib = update_lib(lib)
         rt_mod = tvm.contrib.graph_runtime.create(json, lib, ctx)
@@ -215,10 +218,14 @@ def check_result(mod, map_inputs, out_shape, result, tol=1e-5, target="llvm",
             rt_mod.set_input(name, data)
         rt_mod.set_input(**param)
         rt_mod.run()
-        out = tvm.nd.empty(out_shape, ctx=ctx)
-        out = rt_mod.get_output(0, out)
 
-        tvm.testing.assert_allclose(out.asnumpy(), result, rtol=tol, atol=tol)
+        out_shapes = out_shape if isinstance(out_shape, list) else [out_shape]
+        results = result if isinstance(result, list) else [result]
+
+        for idx, shape in enumerate(out_shapes):
+            out = tvm.nd.empty(shape, ctx=ctx)
+            out = rt_mod.get_output(idx, out)
+            tvm.testing.assert_allclose(out.asnumpy(), results[idx], rtol=tol, atol=tol)
 
     check_vm_result()
     check_graph_runtime_result()
@@ -454,21 +461,17 @@ def test_extern_dnnl_mobilenet():
 
     dtype = 'float32'
     ishape = (1, 3, 224, 224)
-    mod, params = relay.testing.mobilenet.get_workload(
-        batch_size=1, dtype='float32')
-
-    mod = transform.AnnotateTarget(["dnnl"])(mod)
+    ref_mod, params = relay.testing.mobilenet.get_workload(batch_size=1, dtype='float32')
+    mod = transform.AnnotateTarget(["dnnl"])(ref_mod)
     mod = transform.MergeCompilerRegions()(mod)
     mod = transform.PartitionGraph()(mod)
     i_data = np.random.uniform(0, 1, ishape).astype(dtype)
 
-    ref_mod, params = relay.testing.mobilenet.get_workload(batch_size=1,
-                                                           dtype='float32')
     ref_ex = relay.create_executor("graph", mod=ref_mod, ctx=tvm.cpu(0))
     ref_res = ref_ex.evaluate()(i_data, **params)
+    compile_engine.get().clear()
 
-    check_result(mod, {"data": i_data},
-                 (1, 1000), ref_res.asnumpy(), tol=1e-5, params=params)
+    check_result(mod, {"data": i_data}, (1, 1000), ref_res.asnumpy(), tol=1e-5, params=params)
 
 
 def test_function_lifting():
@@ -504,7 +507,7 @@ def test_function_lifting():
             transform.AlterOpLayout(),
         ])
 
-        with relay.build_config(opt_level=3):
+        with tvm.transform.PassContext(opt_level=3):
             mod = opt_pass(mod)
 
         return mod
@@ -587,7 +590,7 @@ def test_function_lifting_inline():
             transform.Inline(),
         ])
 
-        with relay.build_config(opt_level=3):
+        with tvm.transform.PassContext(opt_level=3):
             mod = opt_pass(mod)
 
         return mod
@@ -877,7 +880,8 @@ def test_dnnl_fuse():
             transform.PartitionGraph()
         ])
 
-        with relay.build_config(opt_level=3, disabled_pass=["AlterOpLayout"]):
+        with tvm.transform.PassContext(opt_level=3,
+                                       disabled_pass=["AlterOpLayout"]):
             return composite_partition(mod)
 
     def test_detect_pattern(pattern_table, include_bn, include_sigmoid,
@@ -1025,7 +1029,7 @@ def test_multiple_use_of_an_output():
 def test_duplicate_outputs():
     target = "test_duplicate_outputs"
 
-    @reg.register("abs", "target." + target)
+    @tvm.ir.register_op_attr("abs", "target." + target)
     def abs(attrs, args): # pylint: disable=unused-variable
         return True
 
@@ -1081,12 +1085,12 @@ def test_duplicate_outputs():
 def test_duplicate_merge_and_tuplegetitem():
     target = "test_duplicate_merge_and_tuplegetitem"
 
-    @reg.register("nn.batch_norm", "target." + target)
-    def abs(attrs, args): # pylint: disable=unused-variable
+    @tvm.ir.register_op_attr("nn.batch_norm", "target." + target)
+    def batch_norm(attrs, args): # pylint: disable=unused-variable
         return True
 
-    @reg.register("nn.relu", "target." + target)
-    def abs(attrs, args): # pylint: disable=unused-variable
+    @tvm.ir.register_op_attr("nn.relu", "target." + target)
+    def relu(attrs, args): # pylint: disable=unused-variable
         return True
 
     def create_graph():
@@ -1156,7 +1160,7 @@ def test_duplicate_merge_and_tuplegetitem():
     assert tvm.ir.structural_equal(partitioned, ref_mod, map_free_vars=True)
 
 def test_constant_tuples():
-    @reg.register("qnn.concatenate", "target.const_tuples")
+    @tvm.ir.register_op_attr("qnn.concatenate", "target.const_tuples")
     def add(attrs, args):  # pylint: disable=unused-variable
         return True
 
@@ -1191,6 +1195,127 @@ def test_constant_tuples():
     assert type(concat.args[3]) == relay.Constant
     assert type(concat.args[4]) == relay.Constant
 
+def test_flatten_tuple_output():
+    target = "test_flatten_tuple_output"
+
+    @tvm.ir.register_op_attr("split", "target." + target)
+    def split(attrs, args): # pylint: disable=unused-variable
+        return True
+
+    @tvm.ir.register_op_attr("abs", "target." + target)
+    def abs(attrs, args): # pylint: disable=unused-variable
+        return True
+
+    def create_graph():
+        a = relay.var('a', shape=(10, 10), dtype="uint8")
+
+        a_split = relay.split(a, 2)
+        a_split_0 = relay.TupleGetItem(a_split.astuple(),0)
+        a_split_0_abs = relay.abs(a_split_0)
+
+        a_con = relay.concatenate(a_split, 0)
+        a_split_0_relu = relay.nn.relu(a_split_0_abs)
+
+        out = relay.Tuple((a_con, a_split_0_relu))
+        f = relay.Function([a], out)
+        mod = tvm.IRModule.from_expr(f)
+        return mod
+
+    def expected():
+        mod = tvm.IRModule()
+
+        # function 0
+        f0_i0 = relay.var(target + "_0_i0", shape=(10, 10), dtype="uint8")
+        a_split = relay.split(f0_i0, 2)
+        a_split_0 = relay.TupleGetItem(a_split.astuple(), 0)
+        a_split_1 = relay.TupleGetItem(a_split.astuple(), 1)
+        a_split_abs_in = relay.TupleGetItem(a_split.astuple(), 0)
+        abs = relay.abs(a_split_abs_in)
+        tuple_out = relay.Tuple((a_split_0, a_split_1, abs))
+        func0 = relay.Function([f0_i0], tuple_out)
+
+        func0 = func0.with_attr("Primitive", tvm.tir.IntImm("int32", 1))
+        func0 = func0.with_attr("Inline", tvm.tir.IntImm("int32", 1))
+        func0 = func0.with_attr("Compiler", target)
+        func0 = func0.with_attr("global_symbol", target + "_0")
+        gv0 = relay.GlobalVar(target + "_0")
+        mod[gv0] = func0
+
+        #body
+        data = relay.var('a', shape=(10, 10), dtype="uint8")
+        f_out = gv0(data)
+        f_out_0 = relay.TupleGetItem(f_out, 0)
+        f_out_1 = relay.TupleGetItem(f_out, 1)
+        tuple = relay.Tuple((f_out_0, f_out_1))
+        concat = relay.concatenate(tuple,0)
+        f_out_2 = relay.TupleGetItem(f_out, 2)
+        relu = relay.nn.relu(f_out_2)
+        ret_tuple = relay.Tuple((concat, relu))
+        mod["main"] = relay.Function([data], ret_tuple)
+        return mod
+
+    seq = tvm.transform.Sequential([
+        transform.AnnotateTarget(target),
+        transform.MergeCompilerRegions(),
+        transform.PartitionGraph(),
+    ])
+
+    partitioned = seq(create_graph())
+    assert tvm.ir.structural_equal(partitioned, expected(), map_free_vars=True)
+
+def test_tuple_output_exec():
+    """Test C codegen and runtime for a subgraph with a tuple output"""
+    a = relay.var('a', shape=(10, 10), dtype='float32')
+    b = relay.var('b', shape=(10, 10), dtype='float32')
+    ba = relay.annotation.compiler_begin(a, 'ccompiler')
+    bb = relay.annotation.compiler_begin(b, 'ccompiler')
+    add = relay.add(ba, bb)
+    sub = relay.subtract(ba, bb)
+    out = relay.Tuple((add, sub))
+    eout = relay.annotation.compiler_end(out, 'ccompiler')
+    func=relay.Function([a, b], eout)
+    mod = tvm.IRModule()
+    mod["main"] = func
+    mod = transform.PartitionGraph()(mod)
+
+    a_data = np.random.rand(10, 10).astype('float32')
+    b_data = np.random.rand(10, 10).astype('float32')
+
+    check_result(mod, {'a': a_data, 'b': b_data},
+                 [(10, 10), (10, 10)],
+                 [(a_data + b_data), (a_data - b_data)])
+
+def test_extern_opt():
+    def Optimize(mod):
+        return relay.transform.FoldConstant()(mod)
+
+    tvm.register_func("relay.ext.test_target.optimize", Optimize)
+
+    x = relay.var('x', shape=(2, 2))
+    y0 = relay.var('y0', shape=(2, 2))
+    y1 = relay.var('y1', shape=(2, 2))
+    yy0 = relay.annotation.compiler_begin(y0, 'test_target')
+    yy1 = relay.annotation.compiler_begin(y1, 'test_target')
+    z = yy0 + yy1
+    end = relay.annotation.compiler_end(z, 'test_target')
+    f = relay.Function([x, y0, y1], end * x)
+    c = np.ones(shape=(2, 2), dtype="float32")
+    f = bind_params_by_name(f, {"y0": tvm.nd.array(c), "y1": tvm.nd.array(c)})
+    mod = tvm.IRModule()
+    mod["main"] = f
+    mod = transform.PartitionGraph()(mod)
+
+    try:
+        t0 = mod["test_target_0"]
+    except:
+        raise KeyError("test_target_0 not found")
+
+    assert isinstance(t0.body, relay.Constant)
+    expected = np.empty([2, 2])
+    expected.fill(2)
+    tvm.testing.assert_allclose(t0.body.data.asnumpy(), expected, rtol=1e-5,
+                                atol=1e-5)
+
 if __name__ == "__main__":
     test_multi_node_compiler()
     test_extern_ccompiler_single_op()
@@ -1208,3 +1333,6 @@ if __name__ == "__main__":
     test_duplicate_outputs()
     test_duplicate_merge_and_tuplegetitem()
     test_constant_tuples()
+    test_flatten_tuple_output()
+    test_tuple_output_exec()
+    test_extern_opt()

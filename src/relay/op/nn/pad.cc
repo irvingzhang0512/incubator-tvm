@@ -21,14 +21,15 @@
  * \file pad.cc
  * \brief Implementation of operator pad
  */
-#include <topi/nn.h>
 #include <tvm/relay/attrs/nn.h>
 #include <tvm/relay/op.h>
 #include <tvm/tir/data_layout.h>
 #include <tvm/tir/op.h>
+#include <tvm/topi/nn.h>
 
 #include <vector>
 
+#include "../make_op.h"
 #include "../op_common.h"
 
 namespace tvm {
@@ -177,7 +178,7 @@ Array<te::Tensor> PadCompute(const Attrs& attrs, const Array<te::Tensor>& inputs
 }
 
 // Handler to create a call to the padding op used by front-end FFI
-Expr MakePad(Expr data, Array<Array<IndexExpr>> pad_width, double pad_value, std::string pad_mode) {
+Expr MakePad(Expr data, Array<Array<IndexExpr>> pad_width, double pad_value, String pad_mode) {
   auto attrs = make_object<PadAttrs>();
   attrs->pad_value = pad_value;
   attrs->pad_width = std::move(pad_width);
@@ -245,7 +246,7 @@ bool MirrorPadRel(const Array<Type>& types, int num_inputs, const Attrs& attrs,
 }
 
 // Handler to create a call to the padding op used by front-end FFI
-Expr MakeMirrorPad(Expr data, Array<Array<IndexExpr>> pad_width, std::string mode) {
+Expr MakeMirrorPad(Expr data, Array<Array<IndexExpr>> pad_width, String mode) {
   auto attrs = make_object<MirrorPadAttrs>();
   attrs->mode = mode;
   attrs->pad_width = std::move(pad_width);

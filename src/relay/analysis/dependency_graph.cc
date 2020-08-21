@@ -65,7 +65,7 @@ class DependencyGraph::Creator : private ExprFunctor<void(const Expr& e)> {
     parent->children.Push(child_link);
   }
 
-  std::unordered_set<Expr, ObjectHash, ObjectEqual> visited_;
+  std::unordered_set<Expr, ObjectPtrHash, ObjectPtrEqual> visited_;
 
   DependencyGraph::Node* NewNode(bool new_scope) {
     auto* ret = arena_->make<DependencyGraph::Node>();
@@ -137,6 +137,9 @@ class DependencyGraph::Creator : private ExprFunctor<void(const Expr& e)> {
     DependencyGraph::Node* n = graph_.expr_node[GetRef<Expr>(f)];
     DependencyGraph::Node* b = NewNode(true);
     Depend(n, b);
+    for (const auto& p : f->params) {
+      Depend(b, p);
+    }
     Depend(b, f->body);
     graph_.post_dfs_order.push_back(b);
   }
@@ -145,6 +148,7 @@ class DependencyGraph::Creator : private ExprFunctor<void(const Expr& e)> {
     DependencyGraph::Node* n = graph_.expr_node[GetRef<Expr>(l)];
     DependencyGraph::Node* b = NewNode(true);
     Depend(n, b);
+    Depend(b, l->var);
     Depend(b, l->value);
     Depend(b, l->body);
     graph_.post_dfs_order.push_back(b);

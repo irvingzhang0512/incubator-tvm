@@ -37,9 +37,12 @@
 #include <tvm/relay/op_attr_types.h>
 #include <tvm/tir/data_layout.h>
 
+#include <limits>
 #include <string>
 #include <utility>
 #include <vector>
+
+#include "../op/make_op.h"
 
 namespace tvm {
 namespace relay {
@@ -311,6 +314,46 @@ static inline Constant MakeConstantTensor(DataType dtype, std::vector<int64_t> s
 }
 
 /*!
+ * \brief Check whether a shape is static and create corresponding Constant.
+ Eventually this will be removed and replaced with CheckConstantShapeArrayInteger
+ *
+ * \param shape The Array of the shape values.
+ * \return A Constant.
+ */
+static inline Constant CheckConstantShape(const Array<IndexExpr>& shape) {
+  auto shape_array =
+      runtime::NDArray::Empty({int64_t(shape.size())}, DataType::Int(64), {kDLCPU, 0});
+  auto* shape_data = static_cast<int64_t*>(shape_array->data);
+  for (size_t i = 0; i < shape.size(); ++i) {
+    const auto& dim_val = shape[i].as<IntImmNode>();
+    CHECK(dim_val) << "Do not support symbolic shape for "
+                      "Array format. Pass shape as Expr instead.";
+    shape_data[i] = dim_val->value;
+  }
+  return Constant(shape_array);
+}
+
+/*!
+ * \brief Check whether a shape is static and create corresponding Array<Integer>. Will replace
+ * CheckConstantShape after dynamic refactorization is complete
+ *
+ * \param shape The Array of the shape values.
+ * \return A Constant.
+ */
+static inline Array<Integer> CheckConstantShapeArrayInteger(const Array<IndexExpr>& shape) {
+  Array<Integer> constShape;
+
+  for (size_t i = 0; i < shape.size(); ++i) {
+    const auto& dim_val = shape[i].as<IntImmNode>();
+    CHECK(dim_val) << "Do not support symbolic shape for "
+                      "Array format. Pass shape as Expr instead.";
+
+    constShape.push_back(dim_val->value);
+  }
+  return constShape;
+}
+
+/*!
  * \brief Check if two expressions are equal scalars.
  * \param a The expression to be checked.
  * \param b The expression to be checked
@@ -323,6 +366,67 @@ inline bool IsEqualScalar(const Expr& a, const Expr& b) {
     return false;
   }
   return tvm::StructuralEqual()(a, b);
+}
+
+/*!
+ * \brief Convert an element of a NDArray with type int or float to scalar.
+ * \param array Input NDArray
+ * \param i element index
+ * \return Converted scalar value.
+ */
+static inline long double ToScalar(const runtime::NDArray& array, size_t i = 0) {
+  if (array->dtype.code == kDLInt) {
+    if (array->dtype.bits == 8) {
+      return reinterpret_cast<int8_t*>(array->data)[i];
+    } else if (array->dtype.bits == 16) {
+      return reinterpret_cast<int16_t*>(array->data)[i];
+    } else if (array->dtype.bits == 32) {
+      return reinterpret_cast<int32_t*>(array->data)[i];
+    } else if (array->dtype.bits == 64) {
+      return reinterpret_cast<int64_t*>(array->data)[i];
+    }
+  } else if (array->dtype.code == kDLUInt) {
+    if (array->dtype.bits == 8) {
+      return reinterpret_cast<uint8_t*>(array->data)[i];
+    } else if (array->dtype.bits == 16) {
+      return reinterpret_cast<uint16_t*>(array->data)[i];
+    } else if (array->dtype.bits == 32) {
+      return reinterpret_cast<uint32_t*>(array->data)[i];
+    } else if (array->dtype.bits == 64) {
+      return reinterpret_cast<uint64_t*>(array->data)[i];
+    }
+  } else if (array->dtype.code == kDLFloat) {
+#if (__ARM_FP16_FORMAT_IEEE == 1)
+    if (array->dtype.bits == 16) {
+      return reinterpret_cast<__fp16*>(array->data)[i];
+    }
+#endif
+    if (array->dtype.bits == 32) {
+      return reinterpret_cast<float*>(array->data)[i];
+    } else if (array->dtype.bits == 64) {
+      return reinterpret_cast<double*>(array->data)[i];
+    }
+  }
+  LOG(FATAL) << "Unknown data type: " << tvm::runtime::DLDataType2String(array->dtype);
+  // make compiler happy
+  return -std::numeric_limits<double>::infinity();
+}
+
+/*!
+ * \brief Convert a NDArray with type int or float to Array<Integer>.
+ * \param array Input NDArray
+ * \return Converted Array.
+ */
+static inline Array<Integer> ToVector(const runtime::NDArray& array) {
+  size_t ndim = array.Shape().size();
+  CHECK_EQ(ndim, 1) << "This function should only used for shape tensor.";
+  size_t len = array.Shape().front();
+  Array<Integer> out;
+  for (size_t i = 0; i < len; ++i) {
+    long double elem_val = ToScalar(array, i);
+    out.push_back(Integer(IntImm(DataType::Int(32), static_cast<int64_t>(elem_val))));
+  }
+  return out;
 }
 
 inline Expr GetField(Expr t, size_t i) { return TupleGetItem(t, i); }
@@ -367,12 +471,7 @@ T GetScalarFromConstant(Expr expr) {
   return static_cast<T*>(n->data->data)[0];
 }
 
-inline Expr Cast(Expr x, DataType dtype) {
-  static const Op& op = Op::Get("cast");
-  auto attrs = make_object<CastAttrs>();
-  attrs->dtype = dtype;
-  return Call(op, {x}, Attrs(attrs), {});
-}
+inline Expr Cast(Expr x, DataType dtype) { return MakeCast(x, dtype); }
 
 inline Expr Negative(Expr x) {
   static const Op& op = Op::Get("negative");
@@ -394,11 +493,13 @@ inline Expr Round(Expr x) {
   return Call(op, {x}, Attrs(), {});
 }
 
-inline Expr Clip(Expr x, double a_min, double a_max) {
-  static const Op& op = Op::Get("clip");
-  auto attrs = make_object<ClipAttrs>();
-  attrs->a_min = a_min;
-  attrs->a_max = a_max;
+inline Expr Clip(Expr x, double a_min, double a_max) { return MakeClip(x, a_min, a_max); }
+
+inline Expr FixedPointMultiply(Expr x, int32_t multiplier, int32_t shift) {
+  static const Op& op = Op::Get("fixed_point_multiply");
+  auto attrs = make_object<FixedPointMultiplyAttrs>();
+  attrs->multiplier = multiplier;
+  attrs->shift = shift;
   return Call(op, {x}, Attrs(attrs), {});
 }
 
@@ -433,16 +534,16 @@ inline Expr ZerosLike(Expr e) {
 }
 
 inline Expr Zeros(Array<IndexExpr> shape, DataType dtype) {
-  auto attrs = make_object<InitOpAttrs>();
-  attrs->shape = std::move(shape);
-  attrs->dtype = std::move(dtype);
-  static const Op& op = Op::Get("zeros");
-  return Call(op, {}, Attrs(attrs), {});
+  return MakeZeros(CheckConstantShapeArrayInteger(shape), dtype);
 }
 
 inline Expr OnesLike(Expr e) {
   static const Op& op = Op::Get("ones_like");
   return Call(op, {e});
+}
+
+inline Expr Ones(Array<IndexExpr> shape, DataType dtype) {
+  return MakeOnes(CheckConstantShapeArrayInteger(shape), dtype);
 }
 
 inline Expr CollapseSumLike(Expr e) {
@@ -476,21 +577,12 @@ inline Expr Copy(Expr data) {
 }
 
 inline Expr Mean(Expr data, Array<Integer> axis, bool keepdims, bool exclude) {
-  auto attrs = make_object<ReduceAttrs>();
-  attrs->axis = std::move(axis);
-  attrs->keepdims = keepdims;
-  attrs->exclude = exclude;
-  static const Op& op = Op::Get("mean");
-  return Call(op, {data}, Attrs(attrs), {});
+  return MakeReduce(data, axis, keepdims, exclude, "mean");
 }
 
-inline Expr Variance(Expr data, Expr mean, Array<Integer> axis, bool keepdims, bool exclude) {
-  auto attrs = make_object<ReduceAttrs>();
-  attrs->axis = std::move(axis);
-  attrs->keepdims = keepdims;
-  attrs->exclude = exclude;
-  static const Op& op = Op::Get("variance");
-  return Call(op, {data, mean}, Attrs(attrs), {});
+inline Expr Variance(Expr data, Expr mean, Array<Integer> axis, bool keepdims, bool exclude,
+                     bool unbiased = false) {
+  return MakeVariance(data, mean, axis, keepdims, exclude, unbiased);
 }
 
 static inline Expr Where(const Expr& condition, const Expr& x, const Expr& y) {
@@ -504,105 +596,47 @@ static inline Expr GreaterEqual(const Expr& lhs, const Expr& rhs) {
 }
 
 static inline Expr Full(Expr fill_value, Array<IndexExpr> shape, DataType dtype) {
-  auto attrs = make_object<InitOpAttrs>();
-  attrs->shape = std::move(shape);
-  attrs->dtype = std::move(dtype);
-  static const Op& op = Op::Get("full");
-  return Call(op, {fill_value}, Attrs(attrs), {});
+  return MakeFull(fill_value, CheckConstantShapeArrayInteger(shape), dtype);
 }
 
 static inline Expr Conv2D(Expr data, Expr weight, Array<IndexExpr> strides,
                           Array<IndexExpr> padding, Array<IndexExpr> dilation, int groups,
                           IndexExpr channels, Array<IndexExpr> kernel_size, std::string data_layout,
                           std::string kernel_layout, std::string out_layout, DataType out_dtype) {
-  auto attrs = make_object<Conv2DAttrs>();
-  attrs->strides = std::move(strides);
-  attrs->padding = std::move(padding);
-  attrs->dilation = std::move(dilation);
-  attrs->groups = groups;
-  attrs->channels = std::move(channels);
-  attrs->kernel_size = std::move(kernel_size);
-  attrs->data_layout = std::move(data_layout);
-  attrs->kernel_layout = std::move(kernel_layout);
-  attrs->out_layout = std::move(out_layout);
-  attrs->out_dtype = std::move(out_dtype);
-  static const Op& op = Op::Get("nn.conv2d");
-  return Call(op, {data, weight}, Attrs(attrs), {});
+  return MakeConv<Conv2DAttrs>(data, weight, strides, padding, dilation, groups, channels,
+                               kernel_size, data_layout, kernel_layout, out_layout, out_dtype,
+                               "nn.conv2d");
 }
 
 static inline Expr Dense(Expr data, Expr weight, IndexExpr units, DataType out_dtype) {
-  auto attrs = make_object<DenseAttrs>();
-  attrs->units = units;
-  attrs->out_dtype = out_dtype;
-  static const Op& op = Op::Get("nn.dense");
-  return Call(op, {data, weight}, Attrs(attrs), {});
+  return MakeDense(data, weight, units, out_dtype);
 }
 
 static inline Expr Sum(Expr data, Array<Integer> axis, bool keepdims, bool exclude) {
-  auto attrs = make_object<ReduceAttrs>();
-  attrs->axis = std::move(axis);
-  attrs->keepdims = keepdims;
-  attrs->exclude = exclude;
-  static const Op& op = Op::Get("sum");
-  return Call(op, {data}, Attrs(attrs), {});
+  return MakeReduce(data, axis, keepdims, exclude, "sum");
 }
 
-Expr MakeReshape(Expr data, Expr newshape);
-
 static inline Expr Reshape(Expr data, Array<Integer> newshape) {
-  auto newshape_tensor =
-      MakeConstantTensor(DataType::Int(32), {static_cast<int64_t>(newshape.size())}, newshape);
-  return MakeReshape(data, newshape_tensor);
+  return MakeReshape(data, newshape);
 }
 
 static inline Expr AvgPool2D(Expr data, Array<IndexExpr> pool_size, Array<IndexExpr> strides,
                              Array<IndexExpr> padding, std::string layout, bool ceil_mode,
                              bool count_include_pad) {
-  auto attrs = make_object<AvgPool2DAttrs>();
-  attrs->pool_size = std::move(pool_size);
-  attrs->strides = std::move(strides);
-  attrs->padding = std::move(padding);
-  attrs->layout = std::move(layout);
-  attrs->ceil_mode = ceil_mode;
-  attrs->count_include_pad = count_include_pad;
-  static const Op& op = Op::Get("nn.avg_pool2d");
-  return Call(op, {data}, Attrs(attrs), {});
+  return MakeAvgPool<AvgPool2DAttrs>(data, pool_size, strides, padding, layout, ceil_mode,
+                                     count_include_pad, "nn.avg_pool2d");
 }
 
 static inline Expr Pad(Expr data, Array<Array<IndexExpr>> pad_width, double pad_value,
                        std::string pad_mode) {
-  auto attrs = make_object<PadAttrs>();
-  attrs->pad_value = pad_value;
-  attrs->pad_width = std::move(pad_width);
-  attrs->pad_mode = std::move(pad_mode);
-  static const Op& op = Op::Get("nn.pad");
-  return Call(op, {data}, Attrs(attrs), {});
+  return MakePad(data, pad_width, pad_value, pad_mode);
 }
 
-static inline Expr Tile(Expr data, Array<Integer> reps) {
-  auto attrs = make_object<TileAttrs>();
-  attrs->reps = reps;
-  static const Op& op = Op::Get("tile");
-  return Call(op, {data}, Attrs(attrs), {});
+static inline Expr Tile(Expr data, Array<Integer> reps) { return MakeTile(data, reps); }
+
+static inline Expr BroadCastTo(Expr data, Array<IndexExpr> shape) {
+  return MakeBroadCastTo(data, CheckConstantShapeArrayInteger(shape));
 }
-
-Expr MakeBroadCastTo(Expr data, Array<IndexExpr> shape);
-
-Expr MakeConcatenate(Expr data, int axis);
-
-Expr MakeRepeat(Expr data, int repeats, int axis);
-
-Expr MakeStridedSlice(Expr data, Array<Integer> begin, Array<Integer> end, Array<Integer> strides);
-
-Expr MakeStack(Expr data, int axis);
-
-Expr MakeSplit(Expr data, ObjectRef indices_or_sections, int axis);
-
-Expr MakeSqueeze(Expr data, Array<Integer> axis);
-
-Expr MakeExpandDims(Expr data, int axis, int num_newaxis);
-
-Expr MakeLayoutTransform(Expr data, std::string src_layout, std::string dst_layout);
 
 Expr StopFusion(Expr data);
 

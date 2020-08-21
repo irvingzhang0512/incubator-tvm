@@ -24,6 +24,7 @@ import threading
 import logging
 
 import tvm
+from tvm.autotvm.task.dispatcher import DispatchContext, FallbackContext
 from .task import create
 from .topi_integration import TaskExtractEnv
 
@@ -41,13 +42,12 @@ def _lower(mod,
     from tvm.relay.backend import graph_runtime_codegen
 
     if hasattr(target, 'device_name') and target.device_name == "vta":
-        with relay.build_config(opt_level=3, disabled_pass={"AlterOpLayout"}):
-            import vta
-            with vta.build_config():
-                mod, _ = relay.optimize(mod, target, params)
-                grc = graph_runtime_codegen.GraphRuntimeCodegen(None, target)
-                grc.codegen(mod["main"])
-                return
+        import vta
+        with vta.build_config(opt_level=3, disabled_pass={"AlterOpLayout"}):
+            mod, _ = relay.optimize(mod, target, params)
+            grc = graph_runtime_codegen.GraphRuntimeCodegen(None, target)
+            grc.codegen(mod["main"])
+            return
 
     # default case
     # Try graph codegen first to extract autotvm tasks.
@@ -57,7 +57,9 @@ def _lower(mod,
         opt_mod, _ = relay.optimize(mod, target, params)
         grc = graph_runtime_codegen.GraphRuntimeCodegen(None, target)
         grc.codegen(opt_mod["main"])
-    except tvm.TVMError:
+    except tvm.TVMError as e:
+        print("Get errors with GraphRuntimeCodegen for task extraction. "
+              "Fallback to VMCompiler. Error details:\n%s" % str(e))
         compiler = relay.vm.VMCompiler()
         if params:
             compiler.set_params(params)
@@ -79,7 +81,7 @@ def extract_from_program(mod, params, target, target_host=None, ops=None):
         The compilation target
     target_host: tvm.target.Target
         The host compilation target
-    ops: List[relay.op.Op] or None
+    ops: List[tvm.ir.Op] or None
         List of relay ops to be tuned. If not specified, all tunable ops will be extracted.
 
     Returns
@@ -106,7 +108,7 @@ def extract_from_multiple_program(mods, params, target, target_host=None, ops=No
         The compilation target
     target_host: tvm.target.Target
         The host compilation target
-    ops: List[relay.op.Op] or None
+    ops: List[tvm.ir.Op] or None
         List of relay ops to be tuned.  If not specified, all tunable ops will be extracted.
 
     Returns
@@ -116,7 +118,7 @@ def extract_from_multiple_program(mods, params, target, target_host=None, ops=No
     """
     # pylint: disable=import-outside-toplevel
     from tvm import relay
-    import topi
+    from tvm import topi
 
     env = TaskExtractEnv.get()
 
@@ -138,6 +140,11 @@ def extract_from_multiple_program(mods, params, target, target_host=None, ops=No
                                             args=(mod, target, param))
             build_thread.start()
             build_thread.join()
+            relay.backend.compile_engine.get().clear()
+            # Clear the warning message cache in FallbackContext
+            if isinstance(DispatchContext.current, FallbackContext):
+                DispatchContext.current.memory = {}
+                DispatchContext.warning_messages = set()
 
         logger.disabled = old_state
 

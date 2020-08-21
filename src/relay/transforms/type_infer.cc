@@ -26,16 +26,16 @@
  * most efficient code we need to obtain type information for the
  * IR.
  *
- * Like computation graphs the IR leaves most type information
- * implicit and relies performing analysis of the program to
- * generate this information.
+ * Similar to previous computation graph based IRs, the Relay IR leaves
+ * type information implicit and computes types by performing program
+ * analysis.
  *
- * This pass given an expression `e` will infer a type `t` for
- * the expression simultaneous checking the property `e : t`
- * (i.e we can show e has type t).
+ * Given an expression `e` this pass infers a type `t` for
+ * the expression as well as simultaneously checking the property `e : t`
+ * (i.e., we can show e has type t).
  *
- * If we can not infer a type or there are conflicting typing
- * constraints we will trigger an error.
+ * If we can not infer a type or there is a conflicting
+ * constraint it will emit errors.
  */
 #include <tvm/ir/error.h>
 #include <tvm/ir/type_functor.h>
@@ -123,7 +123,7 @@ class TypeInferencer : private ExprFunctor<Type(const Expr&)>,
 
   // map from expression to checked type
   // type inferencer will populate it up
-  std::unordered_map<Expr, ResolvedTypeInfo, ObjectHash, ObjectEqual> type_map_;
+  std::unordered_map<Expr, ResolvedTypeInfo, ObjectPtrHash, ObjectPtrEqual> type_map_;
 
   // The solver used by the inferencer.
   TypeSolver solver_;
@@ -236,7 +236,7 @@ class TypeInferencer : private ExprFunctor<Type(const Expr&)>,
                              << "the number of type vars in the type data: " << td->type_vars.size()
                              << " != " << tc->args.size());
     }
-    std::unordered_map<TypeVar, Type, ObjectHash, ObjectEqual> type_var_map_;
+    std::unordered_map<TypeVar, Type, ObjectPtrHash, ObjectPtrEqual> type_var_map_;
     for (size_t i = 0; i < td->type_vars.size(); ++i) {
       type_var_map_[td->type_vars[i]] = tc->args[i];
     }
@@ -555,7 +555,7 @@ class TypeInferencer : private ExprFunctor<Type(const Expr&)>,
 
 class TypeInferencer::Resolver : public ExprMutator, PatternMutator {
  public:
-  Resolver(const std::unordered_map<Expr, ResolvedTypeInfo, ObjectHash, ObjectEqual>& tmap,
+  Resolver(const std::unordered_map<Expr, ResolvedTypeInfo, ObjectPtrHash, ObjectPtrEqual>& tmap,
            TypeSolver* solver)
       : tmap_(tmap), solver_(solver) {}
 
@@ -677,8 +677,8 @@ class TypeInferencer::Resolver : public ExprMutator, PatternMutator {
   Type VisitType(const Type& t) final { return solver_->Resolve(t); }
 
  private:
-  std::unordered_map<Var, Var, ObjectHash, ObjectEqual> vmap_;
-  const std::unordered_map<Expr, ResolvedTypeInfo, ObjectHash, ObjectEqual>& tmap_;
+  std::unordered_map<Var, Var, ObjectPtrHash, ObjectPtrEqual> vmap_;
+  const std::unordered_map<Expr, ResolvedTypeInfo, ObjectPtrHash, ObjectPtrEqual>& tmap_;
   TypeSolver* solver_;
   // whether attach the checked type as type_annotation
   // if original type anntation is missing.

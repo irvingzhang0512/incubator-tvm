@@ -21,6 +21,7 @@ Relay pass transformation infrastructure.
 import types
 import inspect
 import functools
+import warnings
 
 import tvm.ir
 from tvm import te
@@ -31,11 +32,12 @@ from . import _ffi_api
 
 
 def build_config(opt_level=2,
-                 fallback_device=_nd.cpu(),
                  required_pass=None,
                  disabled_pass=None,
                  trace=None):
-    """Configure the build behavior by setting config variables.
+    """Configure the build behavior by setting config variables. This function
+    will be deprecated in TVM v0.7. Instead, we should directly use
+    tvm.transform.PassContext.
 
     Parameters
     ----------
@@ -56,12 +58,9 @@ def build_config(opt_level=2,
                 "EliminateCommonSubexpr": 3,
                 "CombineParallelConv2D": 4,
                 "CombineParallelDense": 4,
+                "CombineParallelBatchMatmul": 4,
                 "FastMath": 4
             }
-
-    fallback_device : int, str, or tvmContext, optional
-        The fallback device. It is also used as the default device for
-        operators without specified device during heterogeneous execution.
 
     required_pass: set of str, optional
         Optimization passes that are required regardless of optimization level.
@@ -77,9 +76,9 @@ def build_config(opt_level=2,
     pass_context: PassContext
         The pass context for optimizations.
     """
-    return tvm.ir.transform.PassContext(
-        opt_level, fallback_device, required_pass,
-        disabled_pass, trace)
+    warnings.warn("relay.build_config will be deprecated. Please use \
+                  tvm.transform.PassContext directly", DeprecationWarning)
+    return tvm.transform.PassContext(opt_level, required_pass, disabled_pass, trace)
 
 
 @tvm._ffi.register_object("relay.FunctionPass")
@@ -278,7 +277,7 @@ def CombineParallelConv2D(min_num_branches=3):
     return _ffi_api.CombineParallelConv2D(min_num_branches)
 
 
-def CombineParallelDense(min_num_branches=3):
+def CombineParallelDense(min_num_branches=3, to_batch=True):
     """Combine multiple dense operators into one. For example:
 
     .. code-block
@@ -296,6 +295,51 @@ def CombineParallelDense(min_num_branches=3):
                 |
             batch_matmul+elemwise/bcast (2,2,2)
 
+    or (if to_batch=False)
+
+    .. code-block
+
+                data
+                |
+            dense+elemwise/bcast (2,2+2)
+
+    Parameters
+    ----------
+    min_num_branches : int
+        The minimum number of required parallel branches for performing this
+        optimization.
+
+    to_batch_matmul : bool
+        If True, combine parallel dense ops into batch_matmul op.
+        If False, combine parallel dense ops into dense op.
+
+    Returns
+    -------
+    ret: tvm.transform.Pass
+        The registered pass that combines parallel dense operators.
+    """
+    return _ffi_api.CombineParallelDense(min_num_branches, to_batch)
+
+def CombineParallelBatchMatmul(min_num_branches=3):
+    """Combine multiple batch matmul operators into one. For example:
+
+    .. code-block
+                             data (1, 2, 3)
+                         /                  \
+        batch_matmul(data, (1, 4, 3))    batch_matmul(data, (1, 5, 3))
+            |                                |
+        elemwise/bcast (1, 2, 4)         elemwise/bcast (1, 2, 5)
+
+    Would become:
+
+    .. code-block
+
+                data (1, 2, 3)
+                |
+            batch_matmul(data, (1, 4+5, 3))
+                |
+            elemwise/bcast (1 ,2, 4+5)
+
     Parameters
     ----------
     min_num_branches : int
@@ -307,7 +351,22 @@ def CombineParallelDense(min_num_branches=3):
     ret: tvm.transform.Pass
         The registered pass that combines parallel dense operators.
     """
-    return _ffi_api.CombineParallelDense(min_num_branches)
+    return _ffi_api.CombineParallelBatchMatmul(min_num_branches)
+
+
+def BatchingOps():
+    """Batching parallel operators into one for Conv2D, Dense and BatchMatmul.
+
+    Returns
+    -------
+    ret: tvm.transform.Pass
+        The sequential pass which apply batching for different operator types.
+    """
+    return tvm.transform.Sequential([
+        CombineParallelConv2D(),
+        CombineParallelDense(),
+        CombineParallelBatchMatmul()
+    ])
 
 
 def AlterOpLayout():
@@ -380,7 +439,7 @@ def MergeComposite(pattern_table):
 
     Parameters
     ----------
-    pattern_table : list(tuple)
+    pattern_table : List[Tuple[str, tvm.relay.dataflow_pattern.DFPattern, Function]]
         A list of (pattern_name, pattern, check) tuples.
         The order of the patterns in the list will determine the order
         of priority in which they are matched.
@@ -455,6 +514,21 @@ def ToANormalForm():
         The registered pass that transforms an expression into A Normal Form.
     """
     return _ffi_api.ToANormalForm()
+
+def ToBasicBlockNormalForm():
+    """Turn an expression to Basic Block Normal Form.
+    We define a block as a group of expressions implied by the scope structure.
+    Each graph node can only belong to a single block.
+    For any value that is being used in multiple blocks, it has to be referred
+    by a Var which is defined in a block, whose scope is the least common ancestor
+    of blocks this value is used.
+
+    Returns
+    -------
+    ret: tvm.transform.Pass
+        The registered pass that transforms an expression into Basic Block Normal Form.
+    """
+    return _ffi_api.ToBasicBlockNormalForm()
 
 
 def ToCPS(expr, mod=None):
@@ -593,6 +667,17 @@ def AnnotateTarget(targets):
     return _ffi_api.AnnotateTarget([tvm.runtime.container.String(t) for t in targets])
 
 
+def DynamicToStatic():
+    """If possible, convert tvm.relay.dynamic* ops to static versions
+
+    Returns
+    -------
+    ret : tvm.transform.Pass
+        The registered pass for dynamic->static conversion.
+    """
+    return _ffi_api.DynamicToStatic()
+
+
 def Inline():
     """Perform inlining on the given Relay IR module. The global functions that
     are marked as `inline` should be always inlined. A cost model will be
@@ -656,7 +741,8 @@ def to_cps(func, mod=None):
     result: tvm.relay.Function
       The output function.
     """
-    return _ffi_api.to_cps(func, mod)
+    use_mod = mod if mod is not None else tvm.ir.IRModule()
+    return _ffi_api.to_cps(func, use_mod)
 
 
 def un_cps(func):
@@ -865,6 +951,7 @@ def DenseToSparse(weight_name, weight_shape):
     """
     return _ffi_api.DenseToSparse(weight_name, weight_shape)
 
+
 def SimplifyFCTranspose(target_weight_name):
     """
     Rewrite ```y = nn.dense(x, transpose(w, [1, 0]))``` to ```y = nn.dense(x, wt)```
@@ -882,3 +969,15 @@ def SimplifyFCTranspose(target_weight_name):
         The registered SimplifyFCTranspose pass.
     """
     return _ffi_api.SimplifyFCTranspose(target_weight_name)
+
+
+def SimplifyExpr():
+    """
+    Simplify the Relay expression, including merging consecutive reshapes.
+
+    Returns
+    -------
+    ret : tvm.transform.Pass
+        The registered SimplifyExpr pass.
+    """
+    return _ffi_api.SimplifyExpr()

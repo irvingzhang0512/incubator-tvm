@@ -30,6 +30,10 @@ class TFParser(object):
     model_dir : tensorflow frozen pb file or a directory that contains saved
     model or checkpoints.
 
+    outputs : List of output tensor names (Optional)
+        Optional output node names. This will be protected for saved model
+        when we do remove training nodes.
+
     Examples
     --------
     .. code-block:: python
@@ -38,11 +42,12 @@ class TFParser(object):
         graphdef = parser.parse()
     """
 
-    def __init__(self, model_dir):
+    def __init__(self, model_dir, outputs=None):
         from tensorflow.core.framework import graph_pb2
         self._tmp_dir = util.tempdir()
         self._model_dir = model_dir
         self._graph = graph_pb2.GraphDef()
+        self._outputs = outputs or []
 
     def _set_graph(self, graph):
         """Set Graph"""
@@ -62,12 +67,16 @@ class TFParser(object):
     def _get_tag_set(self):
         """Return the tag set of saved model, multiple metagraphs are not supported"""
         try:
-            from tensorflow.contrib.saved_model.python.saved_model import reader
+            from tensorflow.contrib.saved_model.python.saved_model.reader \
+                import get_saved_model_tag_sets
         except ImportError:
-            raise ImportError(
-                "InputConfiguration: Unable to import saved_model.reader which is "
-                "required to get tag set from saved model.")
-        tag_sets = reader.get_saved_model_tag_sets(self._model_dir)
+            try:
+                from tensorflow.python.tools.saved_model_utils import get_saved_model_tag_sets
+            except ImportError:
+                raise ImportError(
+                    "InputConfiguration: Unable to import get_saved_model_tag_sets which is "
+                    "required to get tag set from saved model.")
+        tag_sets = get_saved_model_tag_sets(self._model_dir)
         return tag_sets[0]
 
     def _get_output_names(self):
@@ -128,7 +137,8 @@ class TFParser(object):
             output_graph_def = graph_pb2.GraphDef()
             with open(output_graph_filename, "rb") as f:
                 output_graph_def.ParseFromString(f.read())
-            output_graph_def = graph_util.remove_training_nodes(output_graph_def)
+            output_graph_def = graph_util.remove_training_nodes(output_graph_def,
+                                                                protected_nodes=self._outputs)
             return output_graph_def
 
     def _load_ckpt(self):

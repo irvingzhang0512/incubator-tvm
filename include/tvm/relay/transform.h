@@ -58,7 +58,7 @@ using Sequential = tvm::transform::Sequential;
  */
 TVM_DLL Pass CreateFunctionPass(
     const runtime::TypedPackedFunc<Function(Function, IRModule, PassContext)>& pass_func,
-    int opt_level, const std::string& name, const tvm::Array<runtime::String>& required);
+    int opt_level, String name, tvm::Array<String> required);
 
 /*! \brief Remove expressions which does not effect the program result.
  *
@@ -115,6 +115,21 @@ TVM_DLL Pass FuseOps(int fuse_opt_level = -1);
  * \return The pass.
  */
 TVM_DLL Pass RewriteAnnotatedOps(int fallback_device);
+
+/*!
+ * \brief Turn an expression to Basic Block Normal Form.
+ *
+ * We define a block as a group of expressions implied by the scope structure.
+ *
+ * Each graph node can only belong to a single block.
+ *
+ * For any value that is being used in multiple blocks, it has to be referred
+ * by a Var which is defined in a block, whose scope is the least common ancestor
+ * of blocks this value is used.
+ *
+ * \return The pass.
+ */
+TVM_DLL Pass ToBasicBlockNormalForm();
 
 /*!
  * \brief turn a dataflow graph into Administrative Normal Form, or A-Normal Form (ANF).
@@ -223,10 +238,23 @@ TVM_DLL Pass CombineParallelConv2D(uint64_t min_num_branches = 3);
  * `min_num_branch`.
  *
  * \param min_num_branches The minimun number of branches.
+ * \param to_batch_matmul Whether to combine parallel dense ops to batch matmul.
+ *                        If set false, combine dense ops to single dense op.
  *
  * \return The pass.
  */
-TVM_DLL Pass CombineParallelDense(uint64_t min_num_branches = 3);
+TVM_DLL Pass CombineParallelDense(uint64_t min_num_branches = 3, bool to_batch_matmul = true);
+
+/*!
+ * \brief Combine parallel batch_matmul ops into a single batch_matmul
+ *  if the number of branches of this dense operator is not less than
+ * `min_num_branch`.
+ *
+ * \param min_num_branches The minimun number of branches.
+ *
+ * \return The pass.
+ */
+TVM_DLL Pass CombineParallelBatchMatmul(uint64_t min_num_branches = 3);
 
 /*!
  * \brief Backward fold axis scaling into weights of conv/dense operators.
@@ -286,7 +314,7 @@ TVM_DLL Pass AlterOpLayout();
  *                        this specifies the desired layout for data then kernel for nn.conv2d.
  * \return The pass.
  */
-TVM_DLL Pass ConvertLayout(const Map<std::string, Array<String>>& desired_layouts);
+TVM_DLL Pass ConvertLayout(const Map<String, Array<String>>& desired_layouts);
 
 /*!
  * \brief Legalizes an expr with another expression.
@@ -298,7 +326,7 @@ TVM_DLL Pass ConvertLayout(const Map<std::string, Array<String>>& desired_layout
  *
  * \return The pass.
  */
-TVM_DLL Pass Legalize(const std::string& legalize_map_attr_name = "FTVMLegalize");
+TVM_DLL Pass Legalize(const String& legalize_map_attr_name = "FTVMLegalize");
 
 /*!
  * \brief Canonicalize cast expressions to make operator fusion more efficient.
@@ -349,6 +377,13 @@ TVM_DLL Pass Inline();
  */
 TVM_DLL Pass RemoveUnusedFunctions(Array<runtime::String> entry_functions);
 
+/*!
+ * \brief Simplify the Relay expression.
+ *
+ * \return The pass.
+ */
+TVM_DLL Pass SimplifyExpr();
+
 }  // namespace transform
 
 /*!
@@ -387,7 +422,7 @@ TVM_DLL Function InferType(const Function& f, const IRModule& mod, const GlobalV
  *                           an Expr consumed by multiple callers.
  * \return The rewritten expression.
  */
-TVM_DLL Expr ForwardRewrite(const Expr& expr, const std::string& rewrite_map_attr_name,
+TVM_DLL Expr ForwardRewrite(const Expr& expr, const String& rewrite_map_attr_name,
                             std::function<ObjectRef(const Call&)> fcontext = nullptr,
                             std::function<Expr(const Expr&)> fmulti_ref_trigger = nullptr);
 

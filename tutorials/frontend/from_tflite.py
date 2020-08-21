@@ -128,15 +128,15 @@ input_shape = (1, 224, 224, 3)
 input_dtype = "float32"
 
 # Parse TFLite model and convert it to a Relay module
-from tvm import relay
+from tvm import relay, transform
 mod, params = relay.frontend.from_tflite(tflite_model,
                                          shape_dict={input_tensor: input_shape},
                                          dtype_dict={input_tensor: input_dtype})
 
 # Build the module against to x86 CPU
 target = "llvm"
-with relay.build_config(opt_level=3):
-    graph, lib, params = relay.build(mod, target, params=params)
+with transform.PassContext(opt_level=3):
+    lib = relay.build(mod, target, params=params)
 
 ######################################################################
 # Execute on TVM
@@ -146,13 +146,10 @@ from tvm import te
 from tvm.contrib import graph_runtime as runtime
 
 # Create a runtime executor module
-module = runtime.create(graph, lib, tvm.cpu())
+module = runtime.GraphModule(lib['default'](tvm.cpu()))
 
 # Feed input data
 module.set_input(input_tensor, tvm.nd.array(image_data))
-
-# Feed related params
-module.set_input(**params)
 
 # Run
 module.run()
